@@ -150,6 +150,7 @@ cargo build                          # debug build
 cargo clippy                         # lints
 cargo run -p app                     # launch the GUI
 cargo run -p engine --example devices # list endpoints, check VB-Cable
+cargo run -p engine --example passthrough -- 600  # 10-min audio soak test
 cargo test                           # pure-Rust tests, any machine
 cargo test --features device-tests   # also hits real devices; needs VB-Cable
 cargo build --release                # release build
@@ -224,6 +225,13 @@ reaches target. VB-Cable and the speakers run on separate clocks, so track ring 
 ~1 s moving average and, when it strays more than 10 ms from target, drop or repeat one
 frame per 1,000 frames until it returns.
 
+On priming, the ring is also trimmed down to the target (never below the buffer the device
+is asking for). The cable hands over a backlog while the render stream is still opening,
+and because capture and render then both run at the device rate, a ring that starts full
+*stays* full — a stable equilibrium at the worst possible latency. Trimming once, before
+the first sample is played, is inaudible; ongoing drift is corrected a frame at a time
+instead.
+
 **Latency budget at 48 kHz** (estimates — measure your own)
 
 | Stage | Typical delay |
@@ -265,7 +273,7 @@ routing, the UI and presets.
 
 - [x] **1. Skeleton.** Workspace, four crates, `cargo run -p app` opens an empty eframe window. *Done when:* `cargo build` and `cargo clippy` pass.
 - [x] **2. Device list.** A CLI in `engine/examples/` listing render and capture devices. *Done when:* it prints both CABLE ids and your speakers' id.
-- [ ] **3. Pass-through spike.** CABLE Input set as default by hand; capture → ring → render at unity gain, no GUI. *Done when:* a video plays through for 10 minutes with no crackles.
+- [x] **3. Pass-through spike.** CABLE Input set as default by hand; capture → ring → render at unity gain, no GUI. *Done when:* a video plays through for 10 minutes with no crackles.
 - [ ] **4. DSP crate.** Gain, soft clip, limiter, meters, unit tests; plugged into the spike at +6 dB. *Done when:* tests prove output never exceeds the ceiling and the boost is audible.
 - [ ] **5. Drift correction.** Ring-fill tracking and drop/repeat correction, fill logged every 5 s. *Done when:* a 2-hour run holds fill within ±10 ms of target with zero underruns.
 - [ ] **6. Routing.** `IPolicyConfig` switch, save original, restore on exit, panic hook, recovery on next launch. *Done when:* killing the process in Task Manager and relaunching restores your speakers as default.
