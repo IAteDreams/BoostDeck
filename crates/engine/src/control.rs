@@ -58,6 +58,8 @@ pub enum EngineCommand {
     Stop,
     /// Play to this device from now on. Takes effect at once while running.
     SetOutput(String),
+    /// Send a fresh `Devices` event, after the user fixed their setup.
+    RefreshDevices,
     /// Stop, restore, and end the control thread.
     Shutdown,
 }
@@ -103,8 +105,23 @@ pub enum EngineEvent {
     DefaultMovedOffCable(Option<DeviceInfo>),
     /// The original default output is back.
     Restored(Restored),
+    /// What the user can pick from, and whether VB-Cable is usable. Sent
+    /// when the engine starts, after any device change, and on request.
+    Devices(DeviceSnapshot),
     /// Something the user needs to know about, in a sentence.
     Error(String),
+}
+
+/// The devices the UI shows, gathered on the control thread so the UI never
+/// touches COM.
+#[derive(Debug, Clone, Default)]
+pub struct DeviceSnapshot {
+    /// Real outputs, for the picker: active, never a virtual cable.
+    pub outputs: Vec<DeviceInfo>,
+    /// Why VB-Cable cannot be used, or `None` when it can: the setup screen.
+    pub cable_problem: Option<String>,
+    /// `Some(false)` when the cable's two halves run at different rates.
+    pub cable_rates_match: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +236,7 @@ fn run(
         retry_at: None,
         status: EngineStatus::Stopped,
     };
+    control.send_devices();
 
     loop {
         select! {
@@ -229,6 +247,7 @@ fn run(
             recv(notifications) -> notification => {
                 if let Ok(notification) = notification {
                     control.handle_notification(notification);
+                    control.send_devices();
                 }
             },
             default(POLL) => {},
@@ -306,6 +325,7 @@ impl Control {
                     self.try_start_streams();
                 }
             }
+            EngineCommand::RefreshDevices => self.send_devices(),
             EngineCommand::Shutdown => unreachable!("handled by the loop"),
         }
     }
@@ -631,6 +651,21 @@ impl Control {
         self.stop_streams();
         self.backoff.reset();
         self.try_start_streams();
+    }
+
+    fn send_devices(&self) {
+        let snapshot = (|| -> Result<DeviceSnapshot> {
+            let cable = devices::find_cable(&self.enumerator)?;
+            Ok(DeviceSnapshot {
+                outputs: devices::output_candidates(&self.enumerator)?,
+                cable_problem: cable.problem(),
+                cable_rates_match: cable.rates_match(),
+            })
+        })();
+        match snapshot {
+            Ok(snapshot) => self.send(EngineEvent::Devices(snapshot)),
+            Err(error) => log::warn!("Listing devices failed: {error:#}"),
+        }
     }
 
     fn set_status(&mut self, status: EngineStatus) {

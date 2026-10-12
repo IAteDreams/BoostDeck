@@ -18,6 +18,7 @@
 #![cfg(windows)]
 
 pub mod capture;
+pub mod console;
 pub mod control;
 pub mod devices;
 pub mod policy_config;

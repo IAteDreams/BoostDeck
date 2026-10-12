@@ -194,6 +194,11 @@ fn print_event(started: Instant, event: &EngineEvent) {
                 ""
             }
         ),
+        EngineEvent::Devices(snapshot) => format!(
+            "devices  {} real outputs; VB-Cable {}",
+            snapshot.outputs.len(),
+            snapshot.cable_problem.as_deref().unwrap_or("ready")
+        ),
         EngineEvent::Error(message) => format!("ERROR    {message}"),
     };
     println!("{:>7}  {text}", stamp(started));

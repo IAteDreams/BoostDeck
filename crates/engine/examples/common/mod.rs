@@ -1,35 +1,14 @@
-//! Helpers shared by the examples: argument parsing, Ctrl+C, the routing
-//! journal and dB formatting. Each example uses a different subset.
+//! Helpers shared by the examples: argument parsing, the routing journal
+//! and dB formatting. Each example uses a different subset.
 
 #![allow(dead_code, reason = "each example uses only some of these")]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, Result, bail};
 use engine::routing::RoutingJournal;
-use windows::Win32::System::Console::SetConsoleCtrlHandler;
-use windows_core::BOOL;
 
-/// Set by Ctrl+C, so a run ends through the normal path and restores the
-/// default output rather than dying with the cable still in place.
-pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-/// Catches Ctrl+C, which then only sets `INTERRUPTED`.
-pub fn catch_ctrl_c() -> Result<()> {
-    // SAFETY: registers a plain function that only stores to an atomic.
-    unsafe { SetConsoleCtrlHandler(Some(on_ctrl_c), true) }.context("installing the Ctrl+C handler")
-}
-
-pub fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::Relaxed)
-}
-
-unsafe extern "system" fn on_ctrl_c(_ctrl_type: u32) -> BOOL {
-    INTERRUPTED.store(true, Ordering::Relaxed);
-    // Handled: Windows must not kill the process before it restores.
-    true.into()
-}
+pub use engine::console::{catch_ctrl_c, interrupted};
 
 /// Removes `--gain-db <dB>` from the arguments, wherever it is, and returns
 /// the gain: 0 dB when absent. Refuses anything outside the slider's range

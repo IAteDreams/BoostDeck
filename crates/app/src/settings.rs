@@ -10,8 +10,10 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context as _, Result};
+use engine::routing::RoutingJournal;
 use serde::{Deserialize, Serialize};
 
 /// Highest gain the slider offers unless the user unlocks it.
@@ -40,6 +42,10 @@ pub struct Settings {
     /// The device BoostDeck switched away from, to be restored on exit, on
     /// panic, or on the next launch.
     pub original_default_device_id: Option<String>,
+
+    /// The output picked in the dropdown; `None` plays to whatever the
+    /// default was before boost went on.
+    pub output_device_id: Option<String>,
 }
 
 impl Default for Settings {
@@ -50,6 +56,7 @@ impl Default for Settings {
             ring_target_ms: dsp::drift::RING_TARGET_MS,
             routing_active: false,
             original_default_device_id: None,
+            output_device_id: None,
         }
     }
 }
@@ -111,6 +118,66 @@ pub fn path() -> Option<PathBuf> {
         .map(|dirs| dirs.config_dir().join(FILE_NAME))
 }
 
+/// The one copy of the settings, shared by the UI and the engine's control
+/// thread - which records the route through it - so neither saves over the
+/// other's changes. The lock is held only to read or change a field and
+/// save; the real-time threads never see it.
+#[derive(Clone)]
+pub struct SharedSettings {
+    inner: Arc<Mutex<Settings>>,
+    path: Option<PathBuf>,
+}
+
+impl SharedSettings {
+    /// Loads from `path`, or starts from the defaults when there is none.
+    pub fn load(path: Option<PathBuf>) -> Self {
+        let settings = path.as_deref().map(Settings::load).unwrap_or_default();
+        Self {
+            inner: Arc::new(Mutex::new(settings)),
+            path,
+        }
+    }
+
+    /// A copy of the current settings.
+    pub fn get(&self) -> Settings {
+        self.lock().clone()
+    }
+
+    /// Changes the settings and saves them.
+    pub fn update(&self, change: impl FnOnce(&mut Settings)) -> Result<()> {
+        let mut settings = self.lock();
+        change(&mut settings);
+        match &self.path {
+            Some(path) => settings.save(path),
+            None => {
+                log::warn!("No app-data folder; settings not saved");
+                Ok(())
+            }
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Settings> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl RoutingJournal for SharedSettings {
+    fn saved_original(&self) -> Option<String> {
+        let settings = self.lock();
+        settings
+            .routing_active
+            .then(|| settings.original_default_device_id.clone())
+            .flatten()
+    }
+
+    fn record(&mut self, original: Option<&str>) -> Result<()> {
+        self.update(|settings| {
+            settings.routing_active = original.is_some();
+            settings.original_default_device_id = original.map(str::to_owned);
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +231,34 @@ mod tests {
         assert!(settings.routing_active);
         assert_eq!(settings.original_default_device_id.as_deref(), Some("x"));
         assert_eq!(settings.ring_target_ms, dsp::drift::RING_TARGET_MS);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The engine records the route through the shared settings: on disk at
+    /// once, and without losing what the UI changed.
+    #[test]
+    fn the_journal_records_and_clears_the_route_on_disk() {
+        let path = temp_path("journal");
+        let mut shared = SharedSettings::load(Some(path.clone()));
+        shared
+            .update(|s| s.output_device_id = Some("headphones".to_owned()))
+            .unwrap();
+
+        shared.record(Some("speakers")).unwrap();
+        assert_eq!(shared.saved_original().as_deref(), Some("speakers"));
+        let on_disk = Settings::load(&path);
+        assert!(on_disk.routing_active);
+        assert_eq!(
+            on_disk.original_default_device_id.as_deref(),
+            Some("speakers")
+        );
+        assert_eq!(on_disk.output_device_id.as_deref(), Some("headphones"));
+
+        shared.record(None).unwrap();
+        assert_eq!(shared.saved_original(), None);
+        let on_disk = Settings::load(&path);
+        assert!(!on_disk.routing_active);
+        assert_eq!(on_disk.output_device_id.as_deref(), Some("headphones"));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

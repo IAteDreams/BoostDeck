@@ -1,8 +1,8 @@
 //! BoostDeck desktop app.
 //!
-//! Opens the window. On launch it first undoes a default-output switch left
-//! behind by a run that was killed or crashed (step 6); the audio engine,
-//! presets and the real controls arrive in steps 7 through 10.
+//! Opens the window and starts the audio engine behind it. On launch it first
+//! undoes a default-output switch left behind by a run that was killed or
+//! crashed. Presets and the safety rules arrive in steps 9 and 10.
 
 // No console window in release builds (README "Packaging"), but keep one in
 // debug builds so `log` output and panics stay visible while developing.
@@ -20,6 +20,11 @@ fn main() -> eframe::Result {
     // Before anything can route: a panic while the cable is the default puts
     // the user's device back on the way down.
     engine::routing::install_panic_hook();
+    // Ctrl+C in the debug console would otherwise end the process with no
+    // `on_exit`, leaving the cable as the default.
+    if let Err(error) = engine::console::catch_ctrl_c() {
+        log::warn!("{error:#}");
+    }
     // Built before the window opens, so a leftover route from a killed run
     // is undone even if the window never appears.
     let app = BoostDeckApp::new();
