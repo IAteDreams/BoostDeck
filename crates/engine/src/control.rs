@@ -33,6 +33,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, select};
 use rtrb::RingBuffer;
 use wasapi::{DeviceEnumerator, DeviceEventCallbacks, DeviceState, Direction, Role};
+use windows::Win32::Media::Audio::PKEY_AudioEngine_DeviceFormat;
 
 use crate::devices::{self, DeviceInfo};
 use crate::routing::{self, Restored, Route, RoutingJournal};
@@ -88,7 +89,8 @@ pub enum EngineEvent {
         output: DeviceInfo,
         sample_rate: u32,
     },
-    /// The output in use went away; playback moved to `to`.
+    /// The output in use went away; playback moved to `to`. `from` is the
+    /// lost device's name, or its id if Windows has forgotten it.
     OutputFellBack {
         from: String,
         to: DeviceInfo,
@@ -183,6 +185,8 @@ enum Notification {
     Added(String),
     /// The Console default render device changed, to this id if any.
     DefaultChanged(Option<String>),
+    /// A device's shared-mode format - its sample rate - changed.
+    FormatChanged(String),
 }
 
 fn run(
@@ -250,10 +254,16 @@ fn callbacks(notify: Sender<Notification>) -> DeviceEventCallbacks {
     callbacks.set_device_added_callback(move |id| {
         let _ = tx.send(Notification::Added(id));
     });
+    let tx = notify.clone();
     callbacks.set_default_device_callback(move |direction, role, id| {
         // Console and Multimedia move together; one is enough.
         if direction == Direction::Render && role == Role::Console {
-            let _ = notify.send(Notification::DefaultChanged(id));
+            let _ = tx.send(Notification::DefaultChanged(id));
+        }
+    });
+    callbacks.set_property_value_callback(move |id, key| {
+        if key == PKEY_AudioEngine_DeviceFormat {
+            let _ = notify.send(Notification::FormatChanged(id));
         }
     });
     callbacks
@@ -396,8 +406,12 @@ impl Control {
             .clone();
         if output.id != wanted {
             log::warn!("Output {wanted} is unavailable; playing to {}", output.name);
+            let from = devices::by_id(&self.enumerator, wanted)
+                .ok()
+                .flatten()
+                .map_or_else(|| wanted.to_owned(), |d| d.name);
             self.send(EngineEvent::OutputFellBack {
-                from: wanted.to_owned(),
+                from,
                 to: output.clone(),
             });
         }
@@ -472,6 +486,7 @@ impl Control {
                 self.device_arrived(&id)
             }
             Notification::StateChanged(id, _) | Notification::Removed(id) => self.device_left(&id),
+            Notification::FormatChanged(id) => self.format_changed(&id),
         }
     }
 
@@ -588,6 +603,36 @@ impl Control {
         }
     }
 
+    /// The output's sample rate may have changed in Sound settings. A
+    /// stream opened with autoconvert can survive that, with Windows quietly
+    /// resampling; rebuild so the ring runs at the device's new rate. The
+    /// cable's own rate is left to autoconvert.
+    fn format_changed(&mut self, id: &str) {
+        let Some(streams) = &self.streams else {
+            return;
+        };
+        if streams.output.id != id {
+            return;
+        }
+        let rate = match capture::device_sample_rate(&self.enumerator, id) {
+            Ok(rate) => rate,
+            Err(error) => {
+                log::warn!("Reading the new output format failed: {error:#}");
+                return;
+            }
+        };
+        if rate == streams.sample_rate {
+            return;
+        }
+        log::info!(
+            "Output rate changed from {} to {rate} Hz; rebuilding",
+            streams.sample_rate
+        );
+        self.stop_streams();
+        self.backoff.reset();
+        self.try_start_streams();
+    }
+
     fn set_status(&mut self, status: EngineStatus) {
         if self.status != status {
             self.status = status;
@@ -605,6 +650,7 @@ struct Streams {
     render: JoinHandle<Result<()>>,
     capture: JoinHandle<Result<()>>,
     output: DeviceInfo,
+    sample_rate: u32,
     started: Instant,
 }
 
@@ -661,6 +707,7 @@ impl Streams {
             render,
             capture,
             output: output.clone(),
+            sample_rate,
             started: Instant::now(),
         })
     }
