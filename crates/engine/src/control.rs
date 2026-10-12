@@ -425,11 +425,11 @@ impl Control {
             .context("no real output device to play to")?
             .clone();
         if output.id != wanted {
-            log::warn!("Output {wanted} is unavailable; playing to {}", output.name);
             let from = devices::by_id(&self.enumerator, wanted)
                 .ok()
                 .flatten()
                 .map_or_else(|| wanted.to_owned(), |d| d.name);
+            log::warn!("{from} is unavailable; playing to {}", output.name);
             self.send(EngineEvent::OutputFellBack {
                 from,
                 to: output.clone(),
