@@ -46,6 +46,13 @@ pub struct Settings {
     /// The output picked in the dropdown; `None` plays to whatever the
     /// default was before boost went on.
     pub output_device_id: Option<String>,
+
+    /// The gain last in use, for safe start: above +6 dB, the next launch
+    /// starts at +6 dB and offers to restore it.
+    pub last_gain_db: f32,
+
+    /// Set once the first-run safety notice has been acknowledged.
+    pub safety_notice_seen: bool,
 }
 
 impl Default for Settings {
@@ -57,6 +64,8 @@ impl Default for Settings {
             routing_active: false,
             original_default_device_id: None,
             output_device_id: None,
+            last_gain_db: 0.0,
+            safety_notice_seen: false,
         }
     }
 }

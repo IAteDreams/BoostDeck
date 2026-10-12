@@ -28,9 +28,9 @@ const METER_FALL_DB_PER_SEC: f32 = 30.0;
 /// The bottom of the level meters.
 pub const METER_FLOOR_DBFS: f32 = -60.0;
 
-/// The most gain a launch starts with, whatever the active preset says.
-/// Step 10's safe start builds its "Restore +X dB?" offer on top of this.
-const LAUNCH_GAIN_CAP_DB: f32 = 6.0;
+/// Safe start: the most gain a launch starts with. A higher saved gain is
+/// offered back with "Restore +X dB?" rather than applied.
+pub const SAFE_START_DB: f32 = 6.0;
 
 /// Gains closer than this count as the same, for the modified mark: the
 /// slider moves in half-dB steps, so this only absorbs rounding.
@@ -82,6 +82,16 @@ pub struct BoostDeckApp {
     pub presets: PresetStore,
     /// A preset name being typed, or a delete waiting to be confirmed.
     pub preset_edit: Option<PresetEdit>,
+    /// Safe start's offer: the saved gain this launch held back.
+    pub restore_offer: Option<f32>,
+    /// The +24 dB unlock warning is open.
+    pub unlock_dialog: bool,
+    /// The output the streams last played to this session, to notice a
+    /// switch to a new one.
+    last_output_id: Option<String>,
+    /// An output a preset load just picked: arriving there keeps the
+    /// preset's gain instead of resetting to 0 dB.
+    preset_output: Option<String>,
 }
 
 /// The presets panel's in-progress edits.
@@ -135,27 +145,102 @@ impl BoostDeckApp {
             notice,
             presets,
             preset_edit: None,
+            restore_offer: None,
+            unlock_dialog: false,
+            last_output_id: None,
+            preset_output: None,
         };
-        app.apply_active_preset_at_launch();
+        app.safe_start();
         app
     }
 
-    /// The active preset's gain, but never above `LAUNCH_GAIN_CAP_DB`: a
-    /// loud preset left active must not blast the next launch. Its output is
-    /// picked too; `start` falls back if that device is not plugged in.
-    fn apply_active_preset_at_launch(&mut self) {
-        let Some(preset) = self.presets.active().cloned() else {
-            return;
-        };
-        let gain = self.clamp_gain(preset.gain_db).min(LAUNCH_GAIN_CAP_DB);
-        self.set_gain_db(gain);
-        if let Some(device) = preset.output_device
-            && let Err(error) = self
-                .settings
-                .update(|s| s.output_device_id = Some(device.id))
+    /// Starts at the saved gain, but never above `SAFE_START_DB`: a loud
+    /// gain left from last time must not blast this launch. A higher one is
+    /// offered back instead.
+    fn safe_start(&mut self) {
+        let (start, offer) = safe_start_gain(self.clamp_gain(self.settings.get().last_gain_db));
+        self.set_gain_db(start);
+        self.restore_offer = offer;
+    }
+
+    /// Answers safe start's offer.
+    pub fn answer_restore_offer(&mut self, restore: bool) {
+        if let Some(saved) = self.restore_offer.take()
+            && restore
         {
+            self.set_gain_db(self.clamp_gain(saved));
+            self.remember_gain();
+        }
+    }
+
+    /// The gain as the user sets it by hand: the slider, the panic button.
+    /// Any pending offer to restore a louder gain is dropped with it.
+    pub fn set_gain_by_hand(&mut self, db: f32) {
+        self.restore_offer = None;
+        self.set_gain_db(db);
+    }
+
+    /// The panic button: 0 dB at once, and remembered.
+    pub fn panic_to_zero(&mut self) {
+        self.set_gain_by_hand(0.0);
+        self.remember_gain();
+    }
+
+    /// Saves the gain for safe start. Called when a change settles, not on
+    /// every frame of a slider drag.
+    pub fn remember_gain(&self) {
+        let gain = self.gain_db;
+        if let Err(error) = self.settings.update(|s| s.last_gain_db = gain) {
             log::error!("Saving settings failed: {error:#}");
         }
+    }
+
+    /// The unlock checkbox. Turning it on only opens the warning; turning it
+    /// off takes effect at once and brings a gain above +12 dB back down.
+    pub fn set_unlocked(&mut self, unlocked: bool) {
+        if unlocked {
+            self.unlock_dialog = true;
+            return;
+        }
+        if let Err(error) = self.settings.update(|s| s.unlock_max_boost = false) {
+            log::error!("Saving settings failed: {error:#}");
+        }
+        if self.gain_db > self.clamp_gain(self.gain_db) {
+            self.set_gain_db(self.clamp_gain(self.gain_db));
+            self.remember_gain();
+        }
+        self.restore_offer = self.restore_offer.map(|db| self.clamp_gain(db));
+    }
+
+    /// The unlock warning's answer.
+    pub fn answer_unlock(&mut self, unlock: bool) {
+        self.unlock_dialog = false;
+        if unlock && let Err(error) = self.settings.update(|s| s.unlock_max_boost = true) {
+            log::error!("Saving settings failed: {error:#}");
+        }
+    }
+
+    pub fn acknowledge_safety_notice(&mut self) {
+        if let Err(error) = self.settings.update(|s| s.safety_notice_seen = true) {
+            log::error!("Saving settings failed: {error:#}");
+        }
+    }
+
+    /// Start at 0 dB on a new output: the same boost can be far louder on
+    /// headphones than on laptop speakers. A switch a preset load asked for
+    /// keeps the preset's gain - choosing it was the point.
+    fn arrived_at_output(&mut self, output: &DeviceInfo) {
+        let previous = self.last_output_id.replace(output.id.clone());
+        let from_preset = self.preset_output.take().as_deref() == Some(output.id.as_str());
+        if !resets_for_new_output(previous.as_deref(), &output.id, from_preset, self.gain_db) {
+            return;
+        }
+        self.set_gain_by_hand(0.0);
+        self.remember_gain();
+        self.notice = Some(format!(
+            "Boost was set back to 0 dB for {}. Raise it when you are ready.",
+            output.name
+        ));
     }
 
     /// Clamps a gain to the slider's range, which depends on the unlock
@@ -175,7 +260,8 @@ impl BoostDeckApp {
                 return;
             }
         };
-        self.set_gain_db(self.clamp_gain(preset.gain_db));
+        self.set_gain_by_hand(self.clamp_gain(preset.gain_db));
+        self.remember_gain();
         let Some(wanted) = preset.output_device else {
             return;
         };
@@ -194,6 +280,7 @@ impl BoostDeckApp {
         match found {
             Some(id) => {
                 if self.settings.get().output_device_id.as_deref() != Some(id.as_str()) {
+                    self.preset_output = Some(id.clone());
                     self.choose_output(Some(id));
                 }
             }
@@ -396,7 +483,10 @@ impl BoostDeckApp {
             EngineEvent::Playing {
                 output,
                 sample_rate,
-            } => self.playing = Some((output, sample_rate)),
+            } => {
+                self.arrived_at_output(&output);
+                self.playing = Some((output, sample_rate));
+            }
             EngineEvent::OutputFellBack { from, to } => {
                 self.notice = Some(format!("{from} went away; now playing to {}.", to.name));
             }
@@ -451,6 +541,11 @@ impl eframe::App for BoostDeckApp {
     /// engine stops it, which restores the default. The panic hook covers
     /// crashes, and the launch check covers a kill from Task Manager.
     fn on_exit(&mut self) {
+        // An unanswered restore offer keeps the louder saved gain for the
+        // next launch to offer again, rather than overwriting it with +6 dB.
+        if self.restore_offer.is_none() {
+            self.remember_gain();
+        }
         drop(self.engine.take());
         if self.settings.get().routing_active
             && let Err(error) = end_routing(&self.settings)
@@ -499,6 +594,28 @@ fn end_routing(settings: &SharedSettings) -> anyhow::Result<engine::routing::Res
     Ok(restored)
 }
 
+/// Safe start: the gain to launch at, and the louder saved gain to offer
+/// back, if there is one.
+fn safe_start_gain(saved_db: f32) -> (f32, Option<f32>) {
+    if saved_db > SAFE_START_DB {
+        (SAFE_START_DB, Some(saved_db))
+    } else {
+        (saved_db, None)
+    }
+}
+
+/// Whether arriving at `output` resets the boost to 0 dB: only a switch
+/// from another output this session, not one a preset load asked for, and
+/// only when there is boost to take away.
+fn resets_for_new_output(
+    previous: Option<&str>,
+    output: &str,
+    from_preset: bool,
+    gain_db: f32,
+) -> bool {
+    previous.is_some_and(|id| id != output) && !from_preset && gain_db > 0.0
+}
+
 /// Both messages, one after the other, or whichever there is.
 fn join_notices(first: Option<String>, second: Option<String>) -> Option<String> {
     match (first, second) {
@@ -545,5 +662,55 @@ mod tests {
     fn silence_reads_as_the_floor() {
         assert_eq!(dbfs(0.0), METER_FLOOR_DBFS);
         assert!((dbfs(1.0) - 0.0).abs() < 1e-4);
+    }
+
+    /// The Safety table: above +6 dB, start at +6 dB and offer the rest.
+    #[test]
+    fn safe_start_holds_back_a_loud_saved_gain() {
+        assert_eq!(safe_start_gain(12.0), (SAFE_START_DB, Some(12.0)));
+        assert_eq!(safe_start_gain(24.0), (SAFE_START_DB, Some(24.0)));
+        assert_eq!(safe_start_gain(SAFE_START_DB), (SAFE_START_DB, None));
+        assert_eq!(safe_start_gain(3.0), (3.0, None));
+        assert_eq!(safe_start_gain(-10.0), (-10.0, None));
+    }
+
+    /// The Safety table: start at 0 dB on a new output.
+    #[test]
+    fn only_a_real_switch_to_another_output_resets_the_boost() {
+        // Headphones unplugged, playback moved to the speakers.
+        assert!(resets_for_new_output(
+            Some("headphones"),
+            "speakers",
+            false,
+            6.0
+        ));
+        // The first start this session, and a rebuild on the same device.
+        assert!(!resets_for_new_output(None, "speakers", false, 6.0));
+        assert!(!resets_for_new_output(
+            Some("speakers"),
+            "speakers",
+            false,
+            6.0
+        ));
+        // A preset load that picked the output keeps the preset's gain.
+        assert!(!resets_for_new_output(
+            Some("speakers"),
+            "headphones",
+            true,
+            6.0
+        ));
+        // Nothing to take away.
+        assert!(!resets_for_new_output(
+            Some("headphones"),
+            "speakers",
+            false,
+            0.0
+        ));
+        assert!(!resets_for_new_output(
+            Some("headphones"),
+            "speakers",
+            false,
+            -6.0
+        ));
     }
 }

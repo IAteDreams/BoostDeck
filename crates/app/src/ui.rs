@@ -23,6 +23,8 @@ pub fn draw(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
     status_line(app, ui);
     ui.separator();
 
+    safety_notice(app, ui);
+    unlock_dialog(app, ui);
     prompt(app, ui);
     notice(app, ui);
 
@@ -285,6 +287,78 @@ fn status_line(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
     }
 }
 
+/// Shown once, on first launch, over everything else, until acknowledged.
+fn safety_notice(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
+    if app.settings.get().safety_notice_seen {
+        return;
+    }
+    let mut acknowledged = false;
+    egui::Modal::new(egui::Id::new("safety-notice")).show(ui.ctx(), |ui| {
+        ui.set_max_width(320.0);
+        ui.heading("Before you boost");
+        ui.label(
+            "Boosted audio with heavy limiting can damage small laptop speakers and your \
+             hearing if played loud for long periods.",
+        );
+        ui.add_space(4.0);
+        ui.label(format!(
+            "Boost is capped at {:+.0} dB, a limiter is always on, and the red 0 dB button \
+             turns the boost off at once. Start low, especially on headphones.",
+            dsp::GAIN_MAX_DB
+        ));
+        ui.add_space(8.0);
+        acknowledged = ui.button("I understand").clicked();
+    });
+    // Closing the dialog any other way (Escape, a click outside) does not
+    // count: it shows again until acknowledged.
+    if acknowledged {
+        app.acknowledge_safety_notice();
+    }
+}
+
+/// The warning behind the +24 dB unlock.
+fn unlock_dialog(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
+    if !app.unlock_dialog {
+        return;
+    }
+    let mut answer = None;
+    let modal = egui::Modal::new(egui::Id::new("unlock-boost")).show(ui.ctx(), |ui| {
+        ui.set_max_width(320.0);
+        ui.heading(format!(
+            "Allow boost up to {:+.0} dB?",
+            dsp::GAIN_MAX_DB_UNLOCKED
+        ));
+        ui.label(format!(
+            "{:+.0} dB is about 16 times the original level. At that boost most audio is \
+             held at the limiter's ceiling, which sounds harsh and can overheat small \
+             speakers. Played loud for long, it can damage your hearing.",
+            dsp::GAIN_MAX_DB_UNLOCKED
+        ));
+        ui.add_space(4.0);
+        ui.label(
+            "Keep the volume low on headphones, and use the red 0 dB button if it is too loud.",
+        );
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button(format!("Allow {:+.0} dB", dsp::GAIN_MAX_DB_UNLOCKED))
+                .clicked()
+            {
+                answer = Some(true);
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(false);
+            }
+        });
+    });
+    if modal.should_close() && answer.is_none() {
+        answer = Some(false);
+    }
+    if let Some(unlock) = answer {
+        app.answer_unlock(unlock);
+    }
+}
+
 fn prompt(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
     let Some(prompt) = &app.prompt else {
         return;
@@ -367,7 +441,21 @@ fn setup_screen(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
 fn gain_slider(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
     let max = app.settings.get().max_gain_db();
     let mut gain = app.gain_db.min(max);
-    ui.label("Boost");
+    ui.horizontal(|ui| {
+        ui.label("Boost");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // The panic button: always visible, one click back to unity.
+            let panic = egui::Button::new(RichText::new("0 dB").strong().color(Color32::WHITE))
+                .fill(Color32::from_rgb(190, 50, 45));
+            if ui
+                .add(panic)
+                .on_hover_text("Set the boost to 0 dB at once")
+                .clicked()
+            {
+                app.panic_to_zero();
+            }
+        });
+    });
     // Wide enough to set a gain to the half dB; the value box sits beside it.
     ui.spacing_mut().slider_width = (ui.available_width() - 90.0).max(120.0);
     let response = ui.add(
@@ -377,13 +465,39 @@ fn gain_slider(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
             .suffix(" dB"),
     );
     if response.changed() {
-        app.set_gain_db(gain);
+        app.set_gain_by_hand(gain);
+    }
+    // Saved once a change settles: at the end of a drag, or at once for a
+    // click or a typed value.
+    if response.drag_stopped() || (response.changed() && !response.dragged()) {
+        app.remember_gain();
     }
     ui.label(format!(
         "{:+.1} dB = {:.0}% of the original level",
         gain,
         dsp::meter::from_db(gain) * 100.0
     ));
+
+    if let Some(saved) = app.restore_offer {
+        let mut answer = None;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(format!(
+                "Started at {:+.0} dB for safety. Last time you were at {saved:+.1} dB.",
+                state::SAFE_START_DB
+            ));
+            ui.horizontal(|ui| {
+                if ui.button(format!("Restore {saved:+.1} dB")).clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Keep this").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if let Some(restore) = answer {
+            app.answer_restore_offer(restore);
+        }
+    }
 }
 
 fn meters(app: &BoostDeckApp, ui: &mut egui::Ui) {
@@ -465,6 +579,22 @@ fn output_picker(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
 
 fn settings_section(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
     ui.collapsing("Settings", |ui| {
+        let mut unlocked = app.settings.get().unlock_max_boost;
+        if ui
+            .checkbox(
+                &mut unlocked,
+                format!("Allow boost up to {:+.0} dB", dsp::GAIN_MAX_DB_UNLOCKED),
+            )
+            .on_hover_text(format!(
+                "Normally capped at {:+.0} dB. Turning this on asks first.",
+                dsp::GAIN_MAX_DB
+            ))
+            .changed()
+        {
+            app.set_unlocked(unlocked);
+        }
+        ui.add_space(6.0);
+
         let mut ring_target_ms = app.settings.get().ring_target_ms;
         let (low, high) = dsp::drift::RING_TARGET_MS_RANGE;
         ui.label("Ring target");
