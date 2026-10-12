@@ -100,10 +100,28 @@ fn main() -> Result<()> {
         match engine.events().recv_timeout(Duration::from_millis(50)) {
             Ok(event) => {
                 print_event(started, &event);
-                // Standing in for the app's "switch back?" prompt.
-                if let EngineEvent::OutputReturned(device) = event {
-                    println!("{:>7}  switching back to {}", stamp(started), device.name);
-                    engine.send(EngineCommand::SetOutput(device.id));
+                // Standing in for the app's prompts, always answering yes.
+                match event {
+                    // "Your headphones are back. Switch to them?"
+                    EngineEvent::OutputReturned(device) => {
+                        println!("{:>7}  switching back to {}", stamp(started), device.name);
+                        engine.send(EngineCommand::SetOutput(device.id));
+                    }
+                    // "You picked another output. Boost that one instead?"
+                    EngineEvent::DefaultMovedOffCable(Some(device))
+                        if !device.is_virtual_cable() =>
+                    {
+                        println!(
+                            "{:>7}  re-routing, playing to {}",
+                            stamp(started),
+                            device.name
+                        );
+                        engine.send(EngineCommand::Start(StartOptions {
+                            output_id: Some(device.id),
+                            ..StartOptions::default()
+                        }));
+                    }
+                    _ => {}
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}

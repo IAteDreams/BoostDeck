@@ -189,6 +189,13 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Sets, or with `None` clears, the device the panic hook restores. For the
+/// control thread when it pauses a route without restoring it, or picks a
+/// paused one back up.
+pub(crate) fn arm_panic_restore(original_id: Option<&str>) {
+    *lock_restore_on_panic() = original_id.map(str::to_owned);
+}
+
 fn lock_restore_on_panic() -> std::sync::MutexGuard<'static, Option<String>> {
     RESTORE_ON_PANIC
         .lock()

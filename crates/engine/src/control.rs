@@ -207,6 +207,7 @@ fn run(
         events,
         journal,
         route: None,
+        paused_route: None,
         wanted_output: None,
         ring_target_ms: dsp::drift::RING_TARGET_MS,
         streams: None,
@@ -265,6 +266,9 @@ struct Control {
     journal: Box<dyn RoutingJournal>,
     /// Set while CABLE Input is the default because of us.
     route: Option<Route>,
+    /// The route given up when the user moved the default elsewhere, kept
+    /// while paused so playback can resume if the default comes back.
+    paused_route: Option<Route>,
     /// The output the user asked for; `None` means the original default.
     wanted_output: Option<String>,
     ring_target_ms: u32,
@@ -298,6 +302,7 @@ impl Control {
 
     fn start(&mut self) {
         self.stop_streams();
+        self.paused_route = None;
         self.retry_at = None;
         self.backoff.reset();
 
@@ -331,6 +336,7 @@ impl Control {
     /// Stops playing and puts the original default back.
     fn stop(&mut self) {
         self.stop_streams();
+        self.paused_route = None;
         self.retry_at = None;
         self.end_routing();
         if self.status != EngineStatus::CableMissing {
@@ -473,12 +479,13 @@ impl Control {
     /// this too, and notifications can arrive late, so the question is
     /// settled by asking Windows what the default is now.
     fn default_changed(&mut self, _id: Option<String>) {
-        let Some(route) = &self.route else {
-            return;
-        };
         let current = devices::default_device(&self.enumerator, Direction::Render, Role::Console)
             .ok()
             .flatten();
+        let Some(route) = &self.route else {
+            self.default_changed_while_paused(current.as_ref());
+            return;
+        };
         if current
             .as_ref()
             .is_some_and(|d| d.id == route.cable_input.id)
@@ -492,13 +499,40 @@ impl Control {
         self.stop_streams();
         self.retry_at = None;
         // Not ours to undo: the user picked a new default. Drop the record so
-        // the next launch does not "restore" over their choice.
-        self.route = None;
+        // the next launch does not "restore" over their choice. Keep the route
+        // itself, in case Windows hands the default back to the cable.
+        self.paused_route = self.route.take();
+        routing::arm_panic_restore(None);
         if let Err(error) = self.journal.record(None) {
             log::error!("Clearing the routing record failed: {error:#}");
         }
         self.set_status(EngineStatus::PausedOutputChanged);
         self.send(EngineEvent::DefaultMovedOffCable(current));
+    }
+
+    /// Paused because the default moved, and now it is CABLE Input again.
+    /// Nothing reads the cable while paused, so the user would hear nothing.
+    /// That happens when the device they moved to goes away - Bluetooth
+    /// headphones switched off - and Windows picks the cable as the next
+    /// default; or when they pick the cable by hand to get boost back.
+    /// Either way the answer is to play again, on the same route.
+    fn default_changed_while_paused(&mut self, current: Option<&DeviceInfo>) {
+        let Some(paused) = &self.paused_route else {
+            return;
+        };
+        if self.status != EngineStatus::PausedOutputChanged
+            || !current.is_some_and(|d| d.id == paused.cable_input.id)
+        {
+            return;
+        }
+        log::warn!("The default output is CABLE Input again; resuming");
+        if let Err(error) = self.journal.record(Some(&paused.original.id)) {
+            log::error!("Saving the routing record failed: {error:#}");
+        }
+        self.route = self.paused_route.take();
+        routing::arm_panic_restore(self.route.as_ref().map(|r| r.original.id.as_str()));
+        self.backoff.reset();
+        self.try_start_streams();
     }
 
     fn device_left(&mut self, id: &str) {
