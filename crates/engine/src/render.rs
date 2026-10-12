@@ -15,6 +15,8 @@ use anyhow::{Context as _, Result};
 use rtrb::Consumer;
 use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat, initialize_mta};
 
+use dsp::drift::{Correction, DriftCorrector};
+
 use crate::rt::{BYTES_PER_SAMPLE, CHANNELS, ProAudioPriority, RtError, Shared};
 
 /// How long to wait for the device to signal a buffer before treating the
@@ -109,7 +111,12 @@ fn run_inner(config: RenderConfig, mut consumer: Consumer<f32>, shared: &Shared)
         .get_audiorenderclient()
         .context("getting the render client")?;
 
-    let mut output = Output::new(config.sample_rate, buffer_frames, block_align);
+    let mut output = Output::new(
+        config.sample_rate,
+        buffer_frames,
+        block_align,
+        config.target_fill_frames,
+    );
 
     audio_client
         .start_stream()
@@ -166,7 +173,11 @@ fn render_loop(
 
         // Measured after the pull: this is the low-water mark, the margin left
         // for the next capture packet, and the number the target describes.
-        shared.set_ring_fill_frames((consumer.slots() / CHANNELS as usize) as u32);
+        let fill_frames = (consumer.slots() / CHANNELS as usize) as u32;
+        shared.set_ring_fill_frames(fill_frames);
+        if primed {
+            output.track_drift(fill_frames, frames, shared);
+        }
 
         render_client
             .write_to_device_from_deque(frames, &mut output.staging, None)
@@ -307,43 +318,91 @@ struct Output {
     /// One device buffer of interleaved samples, processed in place.
     samples: Vec<f32>,
     chain: dsp::Chain,
+    drift: DriftCorrector,
+    /// The drift correction to make in the next buffer.
+    pending: Option<Correction>,
+    /// The last frame pulled from the ring, for a repeat at the very start
+    /// of a buffer.
+    last_frame: [f32; CHANNELS as usize],
 }
 
 impl Output {
-    fn new(sample_rate: u32, buffer_frames: usize, block_align: usize) -> Self {
+    fn new(
+        sample_rate: u32,
+        buffer_frames: usize,
+        block_align: usize,
+        target_fill_frames: u32,
+    ) -> Self {
         Self {
             staging: VecDeque::with_capacity(block_align * buffer_frames * STAGING_BUFFERS),
             samples: vec![0.0; buffer_frames * CHANNELS as usize],
             chain: dsp::Chain::new(sample_rate, CHANNELS as usize),
+            drift: DriftCorrector::new(sample_rate, target_fill_frames),
+            pending: None,
+            last_frame: [0.0; CHANNELS as usize],
         }
+    }
+
+    /// Feeds the fill left after this buffer's pull to drift correction,
+    /// which decides what the next buffer does.
+    fn track_drift(&mut self, fill_frames: u32, frames: usize, shared: &Shared) {
+        self.pending = self.drift.next(fill_frames, frames as u32);
+        shared.set_ring_fill_average(self.drift.average_frames());
     }
 }
 
 /// Fills one device buffer from the ring, padding with silence if the ring
 /// runs dry, runs it through the DSP chain at the target gain in `Shared`,
 /// queues it for the device and reports the meters.
+///
+/// A pending drift correction lands mid-buffer: a drop pulls one frame from
+/// the ring and discards it, a repeat plays the previous frame again and
+/// pulls one fewer.
 fn process_to_staging(
     output: &mut Output,
     consumer: &mut Consumer<f32>,
     shared: &Shared,
     frames: usize,
 ) {
+    const CH: usize = CHANNELS as usize;
     // The device never asks for more than its buffer; `min` keeps a bad
     // request from panicking on a real-time thread.
-    let wanted = (frames * CHANNELS as usize).min(output.samples.len());
+    let wanted = (frames * CH).min(output.samples.len());
     let samples = &mut output.samples[..wanted];
+    let correction = output.pending.take();
+    let correct_at = samples.len() / CH / 2;
     let mut starved = false;
 
-    for slot in samples.iter_mut() {
-        *slot = match consumer.pop() {
-            Ok(sample) => sample,
-            Err(_) => {
-                // The ring ran dry mid-buffer. Silence is the least bad
-                // filler; the counter is what makes it visible.
-                starved = true;
-                0.0
+    for (index, frame) in samples.chunks_exact_mut(CH).enumerate() {
+        if index == correct_at {
+            match correction {
+                Some(Correction::Drop) => {
+                    for _ in 0..CH {
+                        let _ = consumer.pop();
+                    }
+                    shared.count_drift_drop();
+                }
+                Some(Correction::Repeat) => {
+                    frame.copy_from_slice(&output.last_frame);
+                    shared.count_drift_repeat();
+                    continue;
+                }
+                None => {}
             }
-        };
+        }
+
+        for slot in frame.iter_mut() {
+            *slot = match consumer.pop() {
+                Ok(sample) => sample,
+                Err(_) => {
+                    // The ring ran dry mid-buffer. Silence is the least bad
+                    // filler; the counter is what makes it visible.
+                    starved = true;
+                    0.0
+                }
+            };
+        }
+        output.last_frame.copy_from_slice(frame);
     }
 
     if starved {
@@ -403,7 +462,7 @@ mod tests {
     #[test]
     fn at_0_db_quiet_audio_passes_unchanged_and_is_metered() {
         let shared = Shared::new();
-        let mut output = Output::new(48_000, 8, 8);
+        let mut output = Output::new(48_000, 8, 8, 960);
         let input = [0.5f32, -0.6, 0.25, 0.125];
 
         assert_eq!(render(&shared, &mut output, &input), input.to_vec());
@@ -418,7 +477,7 @@ mod tests {
     fn a_boost_set_in_shared_reaches_the_output() {
         let shared = Shared::new();
         shared.set_target_gain_db(6.0);
-        let mut output = Output::new(48_000, 48_000, 8);
+        let mut output = Output::new(48_000, 48_000, 8, 960);
 
         // A second of quiet audio for the smoother to arrive.
         render(&shared, &mut output, &vec![0.1f32; 96_000]);
@@ -435,7 +494,7 @@ mod tests {
     fn the_render_path_holds_the_ceiling() {
         let shared = Shared::new();
         shared.set_target_gain_db(dsp::GAIN_MAX_DB_UNLOCKED);
-        let mut output = Output::new(48_000, 48_000, 8);
+        let mut output = Output::new(48_000, 48_000, 8, 960);
         let ceiling = dsp::meter::from_db(dsp::LIMITER_CEILING_DBFS);
 
         let loud: Vec<f32> = (0..96_000)
@@ -451,12 +510,101 @@ mod tests {
         assert!(reduction > 0.5 && reduction <= 1.0 + 1e-3, "{reduction}");
     }
 
+    /// Ring holding frames 1, 2, 3, ... as quiet stereo pairs, so which frames
+    /// were played, skipped or doubled can be read straight off the output.
+    fn numbered_ring(frames: usize) -> Consumer<f32> {
+        let (mut producer, consumer) = RingBuffer::<f32>::new(frames * 2);
+        for n in 1..=frames {
+            let sample = n as f32 / 100.0;
+            producer.push(sample).unwrap();
+            producer.push(-sample).unwrap();
+        }
+        consumer
+    }
+
+    fn left_channel(output: &Output) -> Vec<f32> {
+        samples_from(&output.staging)
+            .into_iter()
+            .step_by(2)
+            .collect()
+    }
+
+    /// A drop pulls one frame more than the device asked for and skips it,
+    /// mid-buffer.
+    #[test]
+    fn a_drop_skips_one_frame_mid_buffer() {
+        let shared = Shared::new();
+        let mut output = Output::new(48_000, 8, 8, 960);
+        let mut consumer = numbered_ring(8);
+        output.pending = Some(Correction::Drop);
+
+        process_to_staging(&mut output, &mut consumer, &shared, 4);
+
+        assert_eq!(left_channel(&output), vec![0.01, 0.02, 0.04, 0.05]);
+        assert_eq!(
+            consumer.slots(),
+            3 * 2,
+            "five frames pulled for four played"
+        );
+        assert_eq!((shared.drift_drops(), shared.underruns()), (1, 0));
+        assert_eq!(output.pending, None, "a correction is used once");
+    }
+
+    /// A repeat plays the previous frame twice and pulls one fewer.
+    #[test]
+    fn a_repeat_doubles_one_frame_mid_buffer() {
+        let shared = Shared::new();
+        let mut output = Output::new(48_000, 8, 8, 960);
+        let mut consumer = numbered_ring(8);
+        output.pending = Some(Correction::Repeat);
+
+        process_to_staging(&mut output, &mut consumer, &shared, 4);
+
+        assert_eq!(left_channel(&output), vec![0.01, 0.02, 0.02, 0.03]);
+        assert_eq!(
+            consumer.slots(),
+            5 * 2,
+            "three frames pulled for four played"
+        );
+        assert_eq!((shared.drift_repeats(), shared.underruns()), (1, 0));
+    }
+
+    /// Both channels of the repeated frame are repeated, not just one.
+    #[test]
+    fn a_repeat_keeps_the_frame_whole() {
+        let shared = Shared::new();
+        let mut output = Output::new(48_000, 8, 8, 960);
+        let mut consumer = numbered_ring(8);
+        output.pending = Some(Correction::Repeat);
+
+        process_to_staging(&mut output, &mut consumer, &shared, 4);
+
+        let all = samples_from(&output.staging);
+        assert_eq!(&all[4..6], &[0.02, -0.02]);
+    }
+
+    /// Fill far over target for long enough makes the render path start
+    /// dropping on its own, and records the average it acted on.
+    #[test]
+    fn a_high_fill_leads_to_drops() {
+        let shared = Shared::new();
+        let mut output = Output::new(48_000, 480, 8, 960);
+        for _ in 0..200 {
+            output.track_drift(960 + 1_000, 480, &shared);
+            let mut consumer = numbered_ring(482);
+            process_to_staging(&mut output, &mut consumer, &shared, 480);
+            output.staging.clear();
+        }
+        assert!(shared.drift_drops() > 0);
+        assert_eq!(shared.drift_repeats(), 0);
+        assert!(shared.ring_fill_average() > 960.0 + 480.0);
+    }
     /// A dry ring must not stall the thread: it pads with silence and counts
     /// one underrun for the buffer.
     #[test]
     fn a_dry_ring_pads_with_silence_and_counts_one_underrun() {
         let shared = Shared::new();
-        let mut output = Output::new(48_000, 8, 8);
+        let mut output = Output::new(48_000, 8, 8, 960);
         let (mut producer, mut consumer) = RingBuffer::<f32>::new(8);
         producer.push(0.5).unwrap();
 

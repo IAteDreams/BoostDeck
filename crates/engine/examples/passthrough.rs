@@ -115,7 +115,7 @@ fn main() -> Result<()> {
             .context("spawning the capture thread")?
     };
 
-    report_until_done(&shared, run_for);
+    let fill_range = report_until_done(&shared, run_for);
 
     shared.request_stop();
     let capture_result = capture_handle.join();
@@ -131,6 +131,32 @@ fn main() -> Result<()> {
         shared.overruns(),
         shared.discontinuities()
     );
+
+    // The step-5 bar: fill held within the drift tolerance of target.
+    let tolerance_frames = sample_rate * dsp::drift::DRIFT_TOLERANCE_MS / 1_000;
+    let band = (
+        target_fill_frames.saturating_sub(tolerance_frames),
+        target_fill_frames + tolerance_frames,
+    );
+    match fill_range {
+        Some((low, high)) => {
+            let held = low >= band.0 && high <= band.1;
+            println!(
+                "Fill    : {low}..{high} frames over the run, band {}..{} (target {} frames +/- {} ms): {}",
+                band.0,
+                band.1,
+                target_fill_frames,
+                dsp::drift::DRIFT_TOLERANCE_MS,
+                if held { "held" } else { "NOT held" }
+            );
+        }
+        None => println!("Fill    : no playback recorded"),
+    }
+    println!(
+        "Drift   : {} frames dropped, {} repeated",
+        shared.drift_drops(),
+        shared.drift_repeats()
+    );
     if underruns == 0 {
         println!("No underruns: the audio path held.");
     } else {
@@ -141,21 +167,38 @@ fn main() -> Result<()> {
 }
 
 /// Prints a stats line every few seconds until the time is up, the threads
-/// report an error, or the process is interrupted.
-fn report_until_done(shared: &Shared, run_for: Option<u64>) {
+/// report an error, or the process is interrupted. Returns the lowest and
+/// highest ring fill seen across the whole run, if any was recorded.
+///
+/// The bracketed range on each line is every fill since the previous line,
+/// not a snapshot: a snapshot every 5 s once hid a fill sitting a packet low.
+fn report_until_done(shared: &Shared, run_for: Option<u64>) -> Option<(u32, u32)> {
     let started = Instant::now();
     let deadline = run_for.map(|secs| started + Duration::from_secs(secs));
+    let mut worst: Option<(u32, u32)> = None;
 
     loop {
         thread::sleep(REPORT_EVERY);
 
         let elapsed = started.elapsed().as_secs();
+        let range = shared.take_ring_fill_range();
+        if let Some((low, high)) = range {
+            worst = Some(match worst {
+                Some((worst_low, worst_high)) => (worst_low.min(low), worst_high.max(high)),
+                None => (low, high),
+            });
+        }
+        let (low, high) = range.map_or(("-".to_owned(), "-".to_owned()), |(low, high)| {
+            (low.to_string(), high.to_string())
+        });
         println!(
-            "{elapsed:>5}s  fill {:>5} frames  in {:>6}  out {:>6}  gr {:>4.1}  under {:>3}  over {:>3}  disc {:>3}",
-            shared.ring_fill_frames(),
+            "{elapsed:>5}s  fill avg {:>6.0} [{low:>5}..{high:>5}]  in {:>6}  out {:>6}  gr {:>4.1}  drop {:>3} rep {:>3}  under {:>3}  over {:>3}  disc {:>3}",
+            shared.ring_fill_average(),
             dbfs(shared.take_peak_in()),
             dbfs(shared.take_peak_out()),
             shared.take_gain_reduction_db(),
+            shared.drift_drops(),
+            shared.drift_repeats(),
             shared.underruns(),
             shared.overruns(),
             shared.discontinuities(),
@@ -164,10 +207,10 @@ fn report_until_done(shared: &Shared, run_for: Option<u64>) {
         let error = shared.error();
         if error != RtError::None {
             println!("\nAn audio thread reported {error:?}; stopping.");
-            return;
+            return worst;
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return;
+            return worst;
         }
     }
 }

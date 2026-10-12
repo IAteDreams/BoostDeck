@@ -90,9 +90,22 @@ pub struct Shared {
     discontinuities: AtomicU64,
 
     /// How much audio is left in the ring just after the render thread has
-    /// served the device, in frames: the margin before an underrun. Drift
-    /// correction steers this toward its target in step 5.
+    /// served the device, in frames: the margin before an underrun.
     ring_fill_frames: AtomicU32,
+    /// Lowest and highest of those since the last read. A snapshot every few
+    /// seconds misses what happens in between; these do not. The low one is
+    /// stored inverted, as `u32::MAX - frames` under `fetch_max`, so the
+    /// all-zero default means "nothing recorded" for both.
+    ring_fill_low_inverted: AtomicU32,
+    ring_fill_high: AtomicU32,
+    /// Drift correction's moving average of the fill, as `f32::to_bits` of
+    /// frames: the number it steers to the target.
+    ring_fill_average: AtomicU32,
+
+    /// Frames drift correction dropped (capture's clock fast) and repeated
+    /// (capture's clock slow).
+    drift_drops: AtomicU64,
+    drift_repeats: AtomicU64,
 }
 
 impl Shared {
@@ -200,14 +213,54 @@ impl Shared {
         self.underruns.store(0, Ordering::Relaxed);
         self.overruns.store(0, Ordering::Relaxed);
         self.discontinuities.store(0, Ordering::Relaxed);
+        // Priming swings the fill from a full ring down to the target; that
+        // is not the range playback holds.
+        let _ = self.take_ring_fill_range();
     }
 
     pub fn set_ring_fill_frames(&self, frames: u32) {
         self.ring_fill_frames.store(frames, Ordering::Relaxed);
+        self.ring_fill_low_inverted
+            .fetch_max(u32::MAX - frames, Ordering::Relaxed);
+        self.ring_fill_high.fetch_max(frames, Ordering::Relaxed);
     }
 
     pub fn ring_fill_frames(&self) -> u32 {
         self.ring_fill_frames.load(Ordering::Relaxed)
+    }
+
+    /// Reads the lowest and highest fill since the last call and resets both,
+    /// so each read covers only the period since the previous one. `None`
+    /// when no fill was recorded in between.
+    pub fn take_ring_fill_range(&self) -> Option<(u32, u32)> {
+        let low = u32::MAX - self.ring_fill_low_inverted.swap(0, Ordering::Relaxed);
+        let high = self.ring_fill_high.swap(0, Ordering::Relaxed);
+        (low <= high).then_some((low, high))
+    }
+
+    pub fn set_ring_fill_average(&self, frames: f32) {
+        self.ring_fill_average
+            .store(frames.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn ring_fill_average(&self) -> f32 {
+        f32::from_bits(self.ring_fill_average.load(Ordering::Relaxed))
+    }
+
+    pub fn count_drift_drop(&self) {
+        self.drift_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn count_drift_repeat(&self) {
+        self.drift_repeats.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn drift_drops(&self) -> u64 {
+        self.drift_drops.load(Ordering::Relaxed)
+    }
+
+    pub fn drift_repeats(&self) -> u64 {
+        self.drift_repeats.load(Ordering::Relaxed)
     }
 }
 
@@ -311,6 +364,45 @@ mod tests {
         assert!(shared.should_stop());
     }
 
+    /// The range covers every fill recorded since the last read, then starts
+    /// over; with nothing recorded there is no range.
+    #[test]
+    fn ring_fill_range_tracks_extremes_and_resets_on_read() {
+        let shared = Shared::new();
+        assert_eq!(shared.take_ring_fill_range(), None);
+
+        for frames in [960, 757, 1_237, 960] {
+            shared.set_ring_fill_frames(frames);
+        }
+        assert_eq!(shared.take_ring_fill_range(), Some((757, 1_237)));
+        assert_eq!(shared.take_ring_fill_range(), None);
+
+        // Zero is a real fill - an empty ring - not "nothing recorded".
+        shared.set_ring_fill_frames(0);
+        assert_eq!(shared.take_ring_fill_range(), Some((0, 0)));
+    }
+
+    /// Priming's swing from a full ring is not part of playback's range.
+    #[test]
+    fn resetting_counters_clears_the_fill_range() {
+        let shared = Shared::new();
+        shared.set_ring_fill_frames(24_000);
+        shared.reset_counters();
+        shared.set_ring_fill_frames(960);
+        assert_eq!(shared.take_ring_fill_range(), Some((960, 960)));
+    }
+
+    #[test]
+    fn drift_counters_and_average() {
+        let shared = Shared::new();
+        shared.count_drift_drop();
+        shared.count_drift_drop();
+        shared.count_drift_repeat();
+        shared.set_ring_fill_average(960.5);
+
+        assert_eq!((shared.drift_drops(), shared.drift_repeats()), (2, 1));
+        assert_eq!(shared.ring_fill_average(), 960.5);
+    }
     #[test]
     fn counters_accumulate() {
         let shared = Shared::new();

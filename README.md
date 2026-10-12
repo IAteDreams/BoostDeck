@@ -223,8 +223,10 @@ at the real device's sample rate, with `autoconvert: true`.
 **Buffering and clock drift** — ring capacity 0.5 s of stereo samples; target fill 20 ms
 (a setting from 10 to 60 ms); the render thread outputs silence until the ring first
 reaches target. VB-Cable and the speakers run on separate clocks, so track ring fill as a
-~1 s moving average and, when it strays more than 10 ms from target, drop or repeat one
-frame per 1,000 frames until it returns.
+~1 s moving average and, when it strays more than 5 ms from target, drop or repeat one
+frame per 1,000 frames until it is back at target. That holds the fill within ±10 ms: capture
+delivers 10 ms packets, so drift arrives as whole 10 ms steps, and triggering at 10 ms itself
+would let one step sit at the trigger unanswered until a second took the fill to 20 ms.
 
 Priming keeps the speakers silent for ~200 ms while it plays the ring into the void, pulling
 exactly as playback will, and watches the lowest fill left after a pull. It then puts that
