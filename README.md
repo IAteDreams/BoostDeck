@@ -281,7 +281,7 @@ routing, the UI and presets.
 - [x] **1. Skeleton.** Workspace, four crates, `cargo run -p app` opens an empty eframe window. *Done when:* `cargo build` and `cargo clippy` pass.
 - [x] **2. Device list.** A CLI in `engine/examples/` listing render and capture devices. *Done when:* it prints both CABLE ids and your speakers' id.
 - [x] **3. Pass-through spike.** CABLE Input set as default by hand; capture → ring → render at unity gain, no GUI. *Done when:* a video plays through for 10 minutes with no crackles.
-- [ ] **4. DSP crate.** Gain, soft clip, limiter, meters, unit tests; plugged into the spike at +6 dB. *Done when:* tests prove output never exceeds the ceiling and the boost is audible.
+- [x] **4. DSP crate.** Gain, soft clip, limiter, meters, unit tests; plugged into the spike at +6 dB. *Done when:* tests prove output never exceeds the ceiling and the boost is audible.
 - [x] **5. Drift correction.** Ring-fill tracking and drop/repeat correction, fill logged every 5 s. *Done when:* a 2-hour run holds fill within ±10 ms of target with zero underruns.
 - [x] **6. Routing.** `IPolicyConfig` switch, save original, restore on exit, panic hook, recovery on next launch. *Done when:* killing the process in Task Manager and relaunching restores your speakers as default.
 - [x] **7. Control thread.** Commands, events, device notifications, rebuild with backoff. *Done when:* unplugging headphones, changing the sample rate, and sleep/resume all recover without a restart.
