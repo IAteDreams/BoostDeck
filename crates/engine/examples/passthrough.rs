@@ -1,20 +1,24 @@
-//! Pass-through spike: CABLE Output -> ring -> real speakers, at unity gain.
+//! Pass-through spike: CABLE Output -> ring -> DSP -> real speakers.
 //!
-//! Coding-order step 3. No GUI, no DSP, no routing: this exists to prove the
-//! audio path is stable for hours before anything is built on it.
+//! Coding-order steps 3 and 4. No GUI, no routing: this exists to prove the
+//! audio path is stable for hours, and the boost works, before anything is
+//! built on it.
 //!
 //! ```text
-//! cargo run -p engine --example passthrough              # until Ctrl+C
-//! cargo run -p engine --example passthrough -- 600       # ten minutes
-//! cargo run -p engine --example passthrough -- 600 <id>  # pick the output
+//! cargo run -p engine --example passthrough                    # until Ctrl+C
+//! cargo run -p engine --example passthrough -- 600             # ten minutes
+//! cargo run -p engine --example passthrough -- 600 <id>        # pick the output
+//! cargo run -p engine --example passthrough -- 600 --gain-db 6 # boost by 6 dB
 //! ```
 //!
 //! Set CABLE Input as the Windows default output by hand first (Sound
 //! settings), so apps play into the cable. Routing that automatically is
 //! step 6.
 //!
-//! Use headphones at low volume for the first runs. Nothing here scales the
-//! samples, but a bug in the buffer path can still produce full-scale noise.
+//! Gain defaults to 0 dB and is capped at `dsp::GAIN_MAX_DB` (+12 dB), the
+//! same cap the slider has; the limiter is always on. Use headphones at low
+//! volume for the first runs: a bug in the buffer path can still produce
+//! full-scale noise.
 
 use std::sync::Arc;
 use std::thread;
@@ -30,7 +34,9 @@ use wasapi::{DeviceEnumerator, initialize_mta};
 const REPORT_EVERY: Duration = Duration::from_secs(5);
 
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let gain_db = take_gain_db(&mut args)?;
+    let mut args = args.into_iter();
     let run_for: Option<u64> = match args.next() {
         Some(arg) => Some(
             arg.parse()
@@ -64,6 +70,10 @@ fn main() -> Result<()> {
     println!("Render  : {} [{}]", output.name, output.id);
     println!("Rate    : {sample_rate} Hz, {CHANNELS} ch");
     println!(
+        "Gain    : {gain_db:+.1} dB, limiter ceiling {:.1} dBFS",
+        dsp::LIMITER_CEILING_DBFS
+    );
+    println!(
         "Ring    : {ring_capacity} samples capacity, target fill {target_fill_frames} frames ({} ms)",
         dsp::drift::RING_TARGET_MS
     );
@@ -74,6 +84,9 @@ fn main() -> Result<()> {
 
     let (producer, consumer) = RingBuffer::<f32>::new(ring_capacity);
     let shared = Arc::new(Shared::new());
+    // Set before the streams start; the render thread still ramps up to it
+    // from unity over the smoothing time rather than starting loud.
+    shared.set_target_gain_db(gain_db);
 
     // Render starts first so the device is ready to be fed the moment capture
     // produces anything; it outputs silence until the ring hits its target.
@@ -138,10 +151,11 @@ fn report_until_done(shared: &Shared, run_for: Option<u64>) {
 
         let elapsed = started.elapsed().as_secs();
         println!(
-            "{elapsed:>5}s  fill {:>5} frames  in {:>6}  out {:>6}  under {:>3}  over {:>3}  disc {:>3}",
+            "{elapsed:>5}s  fill {:>5} frames  in {:>6}  out {:>6}  gr {:>4.1}  under {:>3}  over {:>3}  disc {:>3}",
             shared.ring_fill_frames(),
             dbfs(shared.take_peak_in()),
             dbfs(shared.take_peak_out()),
+            shared.take_gain_reduction_db(),
             shared.underruns(),
             shared.overruns(),
             shared.discontinuities(),
@@ -156,6 +170,31 @@ fn report_until_done(shared: &Shared, run_for: Option<u64>) {
             return;
         }
     }
+}
+
+/// Removes `--gain-db <dB>` from the arguments, wherever it is, and returns
+/// the gain: 0 dB when absent. Refuses anything outside the slider's range
+/// rather than quietly clamping it.
+fn take_gain_db(args: &mut Vec<String>) -> Result<f32> {
+    let Some(flag) = args.iter().position(|arg| arg == "--gain-db") else {
+        return Ok(0.0);
+    };
+    args.remove(flag);
+    if flag >= args.len() {
+        bail!("--gain-db needs a value in dB");
+    }
+    let value = args.remove(flag);
+    let gain_db: f32 = value
+        .parse()
+        .with_context(|| format!("--gain-db {value:?} is not a number"))?;
+    if !(dsp::GAIN_MIN_DB..=dsp::GAIN_MAX_DB).contains(&gain_db) {
+        bail!(
+            "--gain-db {gain_db} is outside {} to +{} dB",
+            dsp::GAIN_MIN_DB,
+            dsp::GAIN_MAX_DB
+        );
+    }
+    Ok(gain_db)
 }
 
 /// Peak as dBFS, which is the scale the limiter and the meters work in.

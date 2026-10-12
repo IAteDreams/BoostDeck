@@ -1,13 +1,12 @@
 //! Render thread: ring buffer to the real output device.
 //!
-//! Coding-order step 3, at unity gain. This is a real-time thread, so once the
-//! stream is running it must not allocate, lock, log, or touch a file or a
-//! channel.
+//! Coding-order steps 3 and 4. This is a real-time thread, so once the stream
+//! is running it must not allocate, lock, log, or touch a file or a channel.
 //!
-//! Step 4 inserts the DSP where `copy_to_staging` currently copies straight
-//! through: read the target gain from `Shared`, run gain -> soft clip ->
-//! limiter, then report both peak meters. Until then nothing scales the
-//! samples, which is what keeps the spike safe to listen to.
+//! Each device buffer is pulled from the ring and run through `dsp::Chain` -
+//! gain toward the target in `Shared`, soft clip, limiter - before it is
+//! written out. The limiter is always on, so even at 0 dB anything above the
+//! soft-clip knee is rounded off and nothing passes the ceiling.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -110,9 +109,7 @@ fn run_inner(config: RenderConfig, mut consumer: Consumer<f32>, shared: &Shared)
         .get_audiorenderclient()
         .context("getting the render client")?;
 
-    // Allocated once, before the stream starts, and never grown afterwards.
-    let mut staging: VecDeque<u8> =
-        VecDeque::with_capacity(block_align * buffer_frames * STAGING_BUFFERS);
+    let mut output = Output::new(config.sample_rate, buffer_frames, block_align);
 
     audio_client
         .start_stream()
@@ -122,7 +119,7 @@ fn run_inner(config: RenderConfig, mut consumer: Consumer<f32>, shared: &Shared)
         &audio_client,
         &render_client,
         &event,
-        &mut staging,
+        &mut output,
         &mut consumer,
         shared,
         config.target_fill_frames,
@@ -136,7 +133,7 @@ fn render_loop(
     audio_client: &wasapi::AudioClient,
     render_client: &wasapi::AudioRenderClient,
     event: &wasapi::Handle,
-    staging: &mut VecDeque<u8>,
+    output: &mut Output,
     consumer: &mut Consumer<f32>,
     shared: &Shared,
     target_fill_frames: u32,
@@ -156,7 +153,7 @@ fn render_loop(
             .context("reading the available render space")? as usize;
 
         if primed {
-            copy_to_staging(staging, consumer, shared, frames);
+            process_to_staging(output, consumer, shared, frames);
         } else {
             if priming.tick(consumer, frames, buffer_frames, target_fill_frames as usize) {
                 primed = true;
@@ -164,7 +161,7 @@ fn render_loop(
                 // to playback. Reset so the totals describe the steady state.
                 shared.reset_counters();
             }
-            fill_with_silence(staging, frames);
+            fill_with_silence(&mut output.staging, frames);
         }
 
         // Measured after the pull: this is the low-water mark, the margin left
@@ -172,7 +169,7 @@ fn render_loop(
         shared.set_ring_fill_frames((consumer.slots() / CHANNELS as usize) as u32);
 
         render_client
-            .write_to_device_from_deque(frames, staging, None)
+            .write_to_device_from_deque(frames, &mut output.staging, None)
             .context("writing to the render device")?;
 
         if event.wait_for_event(EVENT_TIMEOUT_MS).is_err() {
@@ -302,22 +299,43 @@ fn trim_to_target(consumer: &mut Consumer<f32>, keep_frames: u32) {
     }
 }
 
+/// Everything the render thread writes through on its way to the device.
+/// Allocated before the stream starts and never grown afterwards.
+struct Output {
+    /// Bytes queued for the device.
+    staging: VecDeque<u8>,
+    /// One device buffer of interleaved samples, processed in place.
+    samples: Vec<f32>,
+    chain: dsp::Chain,
+}
+
+impl Output {
+    fn new(sample_rate: u32, buffer_frames: usize, block_align: usize) -> Self {
+        Self {
+            staging: VecDeque::with_capacity(block_align * buffer_frames * STAGING_BUFFERS),
+            samples: vec![0.0; buffer_frames * CHANNELS as usize],
+            chain: dsp::Chain::new(sample_rate, CHANNELS as usize),
+        }
+    }
+}
+
 /// Fills one device buffer from the ring, padding with silence if the ring
-/// runs dry, and meters the output.
-///
-/// Step 4 replaces the straight copy here with gain -> soft clip -> limiter.
-fn copy_to_staging(
-    staging: &mut VecDeque<u8>,
+/// runs dry, runs it through the DSP chain at the target gain in `Shared`,
+/// queues it for the device and reports the meters.
+fn process_to_staging(
+    output: &mut Output,
     consumer: &mut Consumer<f32>,
     shared: &Shared,
     frames: usize,
 ) {
-    let wanted = frames * CHANNELS as usize;
-    let mut peak = 0.0f32;
+    // The device never asks for more than its buffer; `min` keeps a bad
+    // request from panicking on a real-time thread.
+    let wanted = (frames * CHANNELS as usize).min(output.samples.len());
+    let samples = &mut output.samples[..wanted];
     let mut starved = false;
 
-    for _ in 0..wanted {
-        let sample = match consumer.pop() {
+    for slot in samples.iter_mut() {
+        *slot = match consumer.pop() {
             Ok(sample) => sample,
             Err(_) => {
                 // The ring ran dry mid-buffer. Silence is the least bad
@@ -326,9 +344,6 @@ fn copy_to_staging(
                 0.0
             }
         };
-
-        peak = peak.max(sample.abs());
-        staging.extend(sample.to_le_bytes());
     }
 
     if starved {
@@ -336,9 +351,16 @@ fn copy_to_staging(
         // should read as one event.
         shared.count_underrun();
     }
-    if peak > 0.0 {
-        shared.report_peak_out(peak);
+
+    let report = output.chain.process(samples, shared.target_gain_db());
+    for sample in samples.iter() {
+        output.staging.extend(sample.to_le_bytes());
     }
+
+    if report.peak_out > 0.0 {
+        shared.report_peak_out(report.peak_out);
+    }
+    shared.report_gain_reduction_db(report.gain_reduction_db);
 }
 
 fn fill_with_silence(staging: &mut VecDeque<u8>, frames: usize) {
@@ -363,21 +385,70 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn copies_the_ring_into_bytes_and_meters_the_peak() {
-        let shared = Shared::new();
-        let (mut producer, mut consumer) = RingBuffer::<f32>::new(8);
-        for sample in [0.5f32, -0.75, 0.25, 0.125] {
+    /// Pushes `input` through a ring and one `process_to_staging` call, and
+    /// returns what was queued for the device.
+    fn render(shared: &Shared, output: &mut Output, input: &[f32]) -> Vec<f32> {
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(input.len());
+        for &sample in input {
             producer.push(sample).unwrap();
         }
+        process_to_staging(output, &mut consumer, shared, input.len() / 2);
+        let queued = samples_from(&output.staging);
+        output.staging.clear();
+        queued
+    }
 
-        let mut staging: VecDeque<u8> = VecDeque::new();
-        // Two frames of stereo is four samples.
-        copy_to_staging(&mut staging, &mut consumer, &shared, 2);
+    /// At 0 dB, audio below the soft-clip knee (-4.1 dBFS) reaches the
+    /// speakers bit for bit, and is metered.
+    #[test]
+    fn at_0_db_quiet_audio_passes_unchanged_and_is_metered() {
+        let shared = Shared::new();
+        let mut output = Output::new(48_000, 8, 8);
+        let input = [0.5f32, -0.6, 0.25, 0.125];
 
-        assert_eq!(samples_from(&staging), vec![0.5, -0.75, 0.25, 0.125]);
-        assert_eq!(shared.take_peak_out(), 0.75);
+        assert_eq!(render(&shared, &mut output, &input), input.to_vec());
+        assert_eq!(shared.take_peak_out(), 0.6);
+        assert_eq!(shared.take_gain_reduction_db(), 0.0);
         assert_eq!(shared.underruns(), 0);
+    }
+
+    /// The gain set in `Shared` is what the render path applies, after the
+    /// 30 ms ramp.
+    #[test]
+    fn a_boost_set_in_shared_reaches_the_output() {
+        let shared = Shared::new();
+        shared.set_target_gain_db(6.0);
+        let mut output = Output::new(48_000, 48_000, 8);
+
+        // A second of quiet audio for the smoother to arrive.
+        render(&shared, &mut output, &vec![0.1f32; 96_000]);
+        let out = render(&shared, &mut output, &[0.1, -0.1]);
+
+        let expected = 0.1 * dsp::meter::from_db(6.0);
+        assert!((out[0] - expected).abs() < 1e-6, "{out:?}");
+        assert!((out[1] + expected).abs() < 1e-6, "{out:?}");
+    }
+
+    /// Full-scale input at the top of the unlocked range still leaves the
+    /// render path under the ceiling, and the limiter says it is working.
+    #[test]
+    fn the_render_path_holds_the_ceiling() {
+        let shared = Shared::new();
+        shared.set_target_gain_db(dsp::GAIN_MAX_DB_UNLOCKED);
+        let mut output = Output::new(48_000, 48_000, 8);
+        let ceiling = dsp::meter::from_db(dsp::LIMITER_CEILING_DBFS);
+
+        let loud: Vec<f32> = (0..96_000)
+            .map(|i| if i % 4 < 2 { 1.0 } else { -1.0 })
+            .collect();
+        let out = render(&shared, &mut output, &loud);
+
+        assert!(dsp::meter::peak(&out) <= ceiling);
+        // The soft clip ahead of the limiter already caps the signal below
+        // full scale, so the limiter only ever closes the last ~1 dB to the
+        // -1 dBFS ceiling: its reduction is small by construction.
+        let reduction = shared.take_gain_reduction_db();
+        assert!(reduction > 0.5 && reduction <= 1.0 + 1e-3, "{reduction}");
     }
 
     /// A dry ring must not stall the thread: it pads with silence and counts
@@ -385,14 +456,14 @@ mod tests {
     #[test]
     fn a_dry_ring_pads_with_silence_and_counts_one_underrun() {
         let shared = Shared::new();
+        let mut output = Output::new(48_000, 8, 8);
         let (mut producer, mut consumer) = RingBuffer::<f32>::new(8);
-        producer.push(1.0).unwrap();
+        producer.push(0.5).unwrap();
 
-        let mut staging: VecDeque<u8> = VecDeque::new();
-        copy_to_staging(&mut staging, &mut consumer, &shared, 2);
+        process_to_staging(&mut output, &mut consumer, &shared, 2);
 
         // Still a full buffer: one real sample, then silence.
-        assert_eq!(samples_from(&staging), vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(samples_from(&output.staging), vec![0.5, 0.0, 0.0, 0.0]);
         assert_eq!(
             shared.underruns(),
             1,
@@ -553,22 +624,5 @@ mod tests {
         assert!(!priming.tick(&mut consumer, BUFFER, BUFFER, TARGET));
         assert!(!priming.tick(&mut consumer, 0, BUFFER, TARGET));
         assert_eq!(consumer.slots(), 48_000, "nothing pulled outside a period");
-    }
-
-    /// Unity gain is the whole point of the step-3 spike: whatever came out of
-    /// the cable must reach the speakers unscaled.
-    #[test]
-    fn the_spike_does_not_change_the_samples() {
-        let shared = Shared::new();
-        let input = [0.9f32, -0.9, 0.3, -0.3];
-        let (mut producer, mut consumer) = RingBuffer::<f32>::new(8);
-        for sample in input {
-            producer.push(sample).unwrap();
-        }
-
-        let mut staging: VecDeque<u8> = VecDeque::new();
-        copy_to_staging(&mut staging, &mut consumer, &shared, 2);
-
-        assert_eq!(samples_from(&staging), input.to_vec());
     }
 }

@@ -4,13 +4,17 @@
 //! builds and tests on any machine. The processing path must allocate nothing:
 //! no `Vec` growth, no `Box`, no `String`, no `println!`.
 //!
-//! Filled in by coding-order step 4 (DSP) and step 5 (drift correction).
+//! Coding-order step 4 filled in the processing chain; step 5 fills in drift
+//! correction.
 
+pub mod chain;
 pub mod drift;
 pub mod gain;
 pub mod limiter;
 pub mod meter;
 pub mod softclip;
+
+pub use chain::{Chain, Report};
 
 /// Limiter ceiling in dBFS. Fixed in the MVP; there is no UI switch.
 pub const LIMITER_CEILING_DBFS: f32 = -1.0;

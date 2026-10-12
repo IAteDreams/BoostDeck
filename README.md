@@ -161,7 +161,8 @@ cargo build --release                # release build
 - DSP: for random input and any gain up to +24 dB, output never exceeds the limiter ceiling
 - DSP: at 0 dB, signal below the soft-clip knee passes unchanged
 - DSP: smoother reaches 99% of a new target within 5× its time constant
-- DSP: `process` makes no heap allocations (`assert_no_alloc`)
+- DSP: `process` makes no heap allocations (a counting allocator in `dsp/tests/no_alloc.rs`,
+  in place of `assert_no_alloc`, so `dsp` keeps no dependencies)
 - Drift: simulated fast and slow clocks keep fill within ±10 ms of target
 - Presets: save/load round trip, name rules, last-preset protection
 - Presets: corrupt file falls back to `.bak`, then to built-ins

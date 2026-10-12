@@ -64,6 +64,11 @@ pub struct Shared {
     stop: AtomicBool,
     error: AtomicU32,
 
+    /// Gain the UI asks for, as `f32::to_bits` of decibels. Stored in dB
+    /// rather than linear so the all-zero default is 0 dB - unity - and never
+    /// silence. The render thread smooths toward it; it never jumps.
+    target_gain_db: AtomicU32,
+
     // Peak meters hold `f32::to_bits` of a non-negative magnitude. For values
     // at or above zero the IEEE-754 bit pattern sorts in the same order as the
     // number itself, so `fetch_max` over the bits is a correct max over the
@@ -71,6 +76,9 @@ pub struct Shared {
     // why these are fed absolute values.
     peak_in: AtomicU32,
     peak_out: AtomicU32,
+    /// Deepest limiter gain reduction since the last read, in dB, 0 or more:
+    /// the same non-negative `fetch_max` trick as the peaks.
+    gain_reduction_db: AtomicU32,
 
     /// Times the render thread wanted samples and the ring was empty. Each one
     /// is an audible gap, so this is the number to watch.
@@ -118,6 +126,27 @@ impl Shared {
 
     pub fn clear_error(&self) {
         self.error.store(RtError::None.code(), Ordering::Relaxed);
+    }
+
+    /// Set by the UI; read by the render thread once per buffer. Clamping to
+    /// the allowed range is the caller's job: this stores what it is given.
+    pub fn set_target_gain_db(&self, db: f32) {
+        self.target_gain_db.store(db.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn target_gain_db(&self) -> f32 {
+        f32::from_bits(self.target_gain_db.load(Ordering::Relaxed))
+    }
+
+    /// `db` is taken as a magnitude, like the peaks.
+    pub fn report_gain_reduction_db(&self, db: f32) {
+        self.gain_reduction_db
+            .fetch_max(db.abs().to_bits(), Ordering::Relaxed);
+    }
+
+    /// Reads the deepest gain reduction and resets it, like the peaks.
+    pub fn take_gain_reduction_db(&self) -> f32 {
+        f32::from_bits(self.gain_reduction_db.swap(0, Ordering::Relaxed))
     }
 
     /// `peak` is taken as a magnitude; see the note on the fields.
@@ -234,6 +263,29 @@ mod tests {
         let shared = Shared::new();
         shared.report_peak_out(-0.9);
         assert_eq!(shared.take_peak_out(), 0.9);
+    }
+
+    /// A fresh `Shared` must mean unity gain, never silence or a boost.
+    #[test]
+    fn target_gain_defaults_to_0_db_and_round_trips() {
+        let shared = Shared::new();
+        assert_eq!(shared.target_gain_db(), 0.0);
+
+        shared.set_target_gain_db(6.0);
+        assert_eq!(shared.target_gain_db(), 6.0);
+        shared.set_target_gain_db(-60.0);
+        assert_eq!(shared.target_gain_db(), -60.0);
+    }
+
+    #[test]
+    fn gain_reduction_keeps_the_deepest_and_resets_on_read() {
+        let shared = Shared::new();
+        shared.report_gain_reduction_db(1.5);
+        shared.report_gain_reduction_db(4.0);
+        shared.report_gain_reduction_db(0.0);
+
+        assert_eq!(shared.take_gain_reduction_db(), 4.0);
+        assert_eq!(shared.take_gain_reduction_db(), 0.0);
     }
 
     #[test]
