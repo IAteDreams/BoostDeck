@@ -13,6 +13,10 @@ publish = false
 name = "boostdeck"
 path = "src/main.rs"
 
+[build-dependencies]
+# Compiles the icon and version resource into boostdeck.exe.
+embed-resource.workspace = true
+
 [dependencies]
 dsp.workspace = true
 engine.workspace = true

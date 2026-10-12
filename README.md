@@ -135,6 +135,7 @@ Versions as of October 2026 — run `cargo update` when you start.
 | `directories` | 6 | presets, app | `%APPDATA%` paths |
 | `uuid` | 1 (`v4`, `serde`) | presets | Preset ids |
 | `log` + `simplelog` | 0.4 / 0.12 | app, engine, presets | File logging; never in `dsp`, which must not log on the audio threads |
+| `embed-resource` | 3 | app (build) | Icon and version information in `boostdeck.exe` |
 | `anyhow` / `thiserror` | 1 / 2 | all | Errors |
 
 Keep `windows` pinned to 0.62 so it matches what `wasapi` 0.26 uses; two versions in one
@@ -288,21 +289,31 @@ routing, the UI and presets.
 - [x] **8. GUI.** Status line, on/off, slider, meters, output picker, setup screen, wired to the engine. *Done when:* everything in steps 3–7 works from the window.
 - [x] **9. Presets.** `presets` crate, storage, panel, built-ins. *Done when:* create, rename, duplicate, delete and load all work, and a hand-corrupted `presets.json` recovers from the backup.
 - [x] **10. Safety rules.** Caps, unlock dialog, safe start, panic button, first-run notice. *Done when:* every row of the [Safety](#safety) table is checked by hand.
-- [ ] **11. Package.** Unsigned release build and installer. *Done when:* it installs and runs on a second PC with VB-Cable.
+- [x] **11. Package.** Unsigned release build and installer. *Done when:* it installs and runs on a second PC with VB-Cable.
 
 ### Packaging
 
-The MVP ships unsigned as a portable zip plus an MSI.
+The MVP ships unsigned as a portable zip plus an MSI. One command builds both into
+`dist/`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging/package.ps1
+```
 
 - `app/src/main.rs` carries `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`,
   so release builds open no console window while debug builds keep one for logs.
 - In the workspace `Cargo.toml`: `[profile.release] opt-level = 3`, `lto = "thin"`,
   `codegen-units = 1`. Keep the default `panic = "unwind"`.
-- Embed an app icon with a resource crate such as `embed-resource`.
+- `crates/app/build.rs` embeds `assets/boostdeck.ico` and version information with
+  `embed-resource`; `assets/make-icon.ps1` redraws the icon.
 - Write the log file to `%LOCALAPPDATA%\BoostDeck\logs`, keeping the last 5 files.
-- Portable: zip the `.exe` with a README covering the VB-Cable steps.
-- MSI: `cargo install cargo-wix`, then `cargo wix init` and `cargo wix` inside the app
-  crate. Install the WiX Toolset version your cargo-wix release expects.
+- Portable: the `.exe` zipped with `packaging/README.txt` (the VB-Cable steps) and the
+  licence.
+- MSI: `packaging/boostdeck.wxs`, built with the WiX Toolset v5:
+  `dotnet tool install --global wix --version 5.0.2`. v5 is the last MS-RL release, and
+  unlike cargo-wix's WiX v3 it needs neither admin rights nor .NET 3.5. The script
+  skips the MSI when `wix` is not on `PATH`. Keep the `.wxs` file's `UpgradeCode`: it is
+  how a newer MSI replaces an older one.
 - Do not bundle VB-Cable; link to vb-audio.com and let the setup screen guide the user.
 
 Without signing, users see "Windows protected your PC" on first run (More info → Run

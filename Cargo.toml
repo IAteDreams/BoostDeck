@@ -25,9 +25,10 @@ serde_json = "1"
 directories = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
 log = "0.4"
-simplelog = "0.12"
+simplelog = { version = "0.12", features = ["local-offset"] }
 anyhow = "1"
 thiserror = "2"
+embed-resource = "3"
 
 dsp = { path = "crates/dsp" }
 engine = { path = "crates/engine" }

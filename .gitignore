@@ -10,3 +10,6 @@
 .idea/
 Thumbs.db
 desktop.ini
+
+# Packaged builds (packaging/package.ps1)
+/dist/
