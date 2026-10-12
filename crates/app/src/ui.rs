@@ -1,14 +1,14 @@
 //! Window drawing.
 //!
 //! Top to bottom: status line and boost toggle, any prompt or notice, the
-//! dB slider, the three meters, the output picker, and a collapsed settings
-//! section. While VB-Cable is not usable the controls give way to the setup
-//! screen. The presets panel arrives in step 9.
+//! dB slider, the three meters, the output picker, the presets panel, and a
+//! collapsed settings section. While VB-Cable is not usable the controls give
+//! way to the setup screen.
 
 use eframe::egui::{self, Color32, RichText, Sense, Vec2};
 use engine::control::{EngineCommand, EngineStatus};
 
-use crate::state::{self, BoostDeckApp, METER_FLOOR_DBFS, Prompt};
+use crate::state::{self, BoostDeckApp, METER_FLOOR_DBFS, PresetEdit, Prompt};
 
 /// Full scale for the gain-reduction meter, in dB. The soft clip keeps the
 /// limiter's work to about 1 dB, so 6 dB leaves plenty of headroom.
@@ -47,7 +47,208 @@ pub fn draw(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
         );
     }
     ui.add_space(8.0);
+    presets_panel(app, ui);
+    ui.add_space(8.0);
     settings_section(app, ui);
+}
+
+/// The preset dropdown, its five buttons, and whichever edit is open: a name
+/// field for Save as new or Rename, or a delete confirmation.
+fn presets_panel(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
+    let active = app.presets.active().map(|p| (p.id, p.name.clone()));
+    let modified = app.preset_modified();
+    let selected_text = match &active {
+        Some((_, name)) if modified => format!("{name} \u{2022}"),
+        Some((_, name)) => name.clone(),
+        None => "(none)".to_owned(),
+    };
+
+    let mut load = None;
+    ui.horizontal(|ui| {
+        ui.label("Preset");
+        egui::ComboBox::from_id_salt("preset")
+            .selected_text(selected_text)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for preset in app.presets.list() {
+                    let is_active = active.as_ref().is_some_and(|(id, _)| *id == preset.id);
+                    let label = format!("{}  ({:+.1} dB)", preset.name, preset.gain_db);
+                    // Choosing the active one again reloads it, discarding
+                    // changes - the quick way back to a known state.
+                    if ui.selectable_label(is_active, label).clicked() {
+                        load = Some(preset.id);
+                    }
+                }
+            });
+    });
+    if let Some(id) = load {
+        forget_name_field(ui);
+        app.preset_edit = None;
+        app.load_preset(id);
+    }
+
+    let active_id = active.as_ref().map(|(id, _)| *id);
+    let only_one = app.presets.list().len() <= 1;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(modified, egui::Button::new("Save"))
+            .on_hover_text("Overwrite the preset with the current boost and output")
+            .clicked()
+        {
+            app.save_active_preset();
+        }
+        if ui.button("Save as new").clicked() {
+            forget_name_field(ui);
+            app.preset_edit = Some(PresetEdit::SaveAsNew {
+                name: String::new(),
+                error: None,
+            });
+        }
+        if let Some(id) = active_id {
+            if ui.button("Rename").clicked() {
+                forget_name_field(ui);
+                let name = active.as_ref().map(|(_, n)| n.clone()).unwrap_or_default();
+                app.preset_edit = Some(PresetEdit::Rename {
+                    id,
+                    name,
+                    error: None,
+                });
+            }
+            if ui.button("Duplicate").clicked() {
+                forget_name_field(ui);
+                app.preset_edit = None;
+                app.duplicate_preset(id);
+            }
+            if ui
+                .add_enabled(!only_one, egui::Button::new("Delete"))
+                .on_disabled_hover_text("The last preset cannot be deleted")
+                .clicked()
+            {
+                forget_name_field(ui);
+                app.preset_edit = Some(PresetEdit::ConfirmDelete(id));
+            }
+        }
+    });
+
+    preset_edit(app, ui);
+}
+
+fn preset_edit(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
+    let Some(edit) = app.preset_edit.take() else {
+        return;
+    };
+    let mut keep = true;
+    let edit = match edit {
+        PresetEdit::SaveAsNew {
+            mut name,
+            mut error,
+        } => {
+            match name_field(ui, "New preset name", &mut name, error.as_deref()) {
+                Some(true) => match app.save_preset_as(&name) {
+                    Ok(()) => keep = false,
+                    Err(message) => error = Some(message),
+                },
+                Some(false) => keep = false,
+                None => {}
+            }
+            PresetEdit::SaveAsNew { name, error }
+        }
+        PresetEdit::Rename {
+            id,
+            mut name,
+            mut error,
+        } => {
+            match name_field(ui, "Rename to", &mut name, error.as_deref()) {
+                Some(true) => match app.rename_preset(id, &name) {
+                    Ok(()) => keep = false,
+                    Err(message) => error = Some(message),
+                },
+                Some(false) => keep = false,
+                None => {}
+            }
+            PresetEdit::Rename { id, name, error }
+        }
+        PresetEdit::ConfirmDelete(id) => {
+            let name = app
+                .presets
+                .get(id)
+                .map_or_else(String::new, |p| p.name.clone());
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(format!("Delete {name}? This cannot be undone."));
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        app.delete_preset(id);
+                        keep = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+            PresetEdit::ConfirmDelete(id)
+        }
+    };
+    if keep {
+        app.preset_edit = Some(edit);
+    }
+}
+
+/// A name field with OK and Cancel. `Some(true)` is OK (or Enter),
+/// `Some(false)` Cancel (or Escape), `None` still typing.
+fn name_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    name: &mut String,
+    error: Option<&str>,
+) -> Option<bool> {
+    let mut answer = None;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(label);
+        ui.horizontal(|ui| {
+            let mut output = egui::TextEdit::singleline(name)
+                .char_limit(presets::NAME_LEN_RANGE.1)
+                .desired_width(ui.available_width() - 120.0)
+                .show(ui);
+            // On the frame it opens, take the keyboard and select what is
+            // there, so typing replaces the old name rather than needing a
+            // click first.
+            if !ui.data(|d| d.get_temp::<bool>(name_field_id()).unwrap_or(false)) {
+                output.response.request_focus();
+                let all = egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(name.chars().count()),
+                );
+                output.state.cursor.set_char_range(Some(all));
+                output.state.store(ui.ctx(), output.response.id);
+                ui.data_mut(|d| d.insert_temp(name_field_id(), true));
+            }
+            let field = output.response;
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("OK").clicked() || entered {
+                answer = Some(true);
+            }
+            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                answer = Some(false);
+            }
+        });
+        if let Some(error) = error {
+            ui.label(RichText::new(error).color(Color32::from_rgb(210, 70, 60)));
+        }
+    });
+    if answer.is_some() {
+        forget_name_field(ui);
+    }
+    answer
+}
+
+/// Remembers that the open name field has taken focus once.
+fn name_field_id() -> egui::Id {
+    egui::Id::new("preset-name-field-focused")
+}
+
+/// Lets the next name field to open take focus again.
+fn forget_name_field(ui: &egui::Ui) {
+    ui.data_mut(|d| d.remove::<bool>(name_field_id()));
 }
 
 fn status_line(app: &mut BoostDeckApp, ui: &mut egui::Ui) {

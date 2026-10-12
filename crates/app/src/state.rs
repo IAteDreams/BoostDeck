@@ -4,6 +4,7 @@
 //! `EngineCommand`s out and `EngineEvent`s in, and writes the gain straight
 //! into the `Shared` atomics so slider moves never wait on a channel.
 
+use std::path::Path;
 use std::time::Duration;
 
 use eframe::egui;
@@ -11,6 +12,8 @@ use engine::control::{
     DeviceSnapshot, Engine, EngineCommand, EngineEvent, EngineStatus, StartOptions,
 };
 use engine::devices::DeviceInfo;
+use presets::{DeviceRef, PresetStore};
+use uuid::Uuid;
 
 use crate::settings::{self, SharedSettings};
 
@@ -24,6 +27,14 @@ const METER_FALL_DB_PER_SEC: f32 = 30.0;
 
 /// The bottom of the level meters.
 pub const METER_FLOOR_DBFS: f32 = -60.0;
+
+/// The most gain a launch starts with, whatever the active preset says.
+/// Step 10's safe start builds its "Restore +X dB?" offer on top of this.
+const LAUNCH_GAIN_CAP_DB: f32 = 6.0;
+
+/// Gains closer than this count as the same, for the modified mark: the
+/// slider moves in half-dB steps, so this only absorbs rounding.
+const GAIN_EPSILON_DB: f32 = 0.01;
 
 /// A question the engine wants put to the user.
 #[derive(Debug, Clone)]
@@ -68,14 +79,36 @@ pub struct BoostDeckApp {
     pub prompt: Option<Prompt>,
     /// A message for the user that stays until dismissed.
     pub notice: Option<String>,
+    pub presets: PresetStore,
+    /// A preset name being typed, or a delete waiting to be confirmed.
+    pub preset_edit: Option<PresetEdit>,
+}
+
+/// The presets panel's in-progress edits.
+#[derive(Debug, Clone)]
+pub enum PresetEdit {
+    SaveAsNew {
+        name: String,
+        error: Option<String>,
+    },
+    Rename {
+        id: Uuid,
+        name: String,
+        error: Option<String>,
+    },
+    ConfirmDelete(Uuid),
 }
 
 impl BoostDeckApp {
-    /// Loads the settings, undoes a route a killed run left behind, and
-    /// starts the engine. Boost itself stays off until the user turns it on.
+    /// Loads the settings and presets, undoes a route a killed run left
+    /// behind, starts the engine, and applies the active preset. Boost
+    /// itself stays off until the user turns it on.
     pub fn new() -> Self {
-        let settings = SharedSettings::load(settings::path());
-        let notice = recover_routing(&settings);
+        let settings_path = settings::path();
+        let settings = SharedSettings::load(settings_path.clone());
+        let (presets, presets_loaded) =
+            PresetStore::load(settings_path.as_deref().and_then(Path::parent));
+        let notice = join_notices(recover_routing(&settings), presets_loaded.notice());
 
         let engine = match Engine::spawn(Box::new(settings.clone())) {
             Ok(engine) => Some(engine),
@@ -89,7 +122,7 @@ impl BoostDeckApp {
             None => Some("The audio engine could not start; see the log.".to_owned()),
         };
 
-        Self {
+        let mut app = Self {
             settings,
             engine,
             status: EngineStatus::Stopped,
@@ -100,6 +133,161 @@ impl BoostDeckApp {
             meters: Meters::default(),
             prompt: None,
             notice,
+            presets,
+            preset_edit: None,
+        };
+        app.apply_active_preset_at_launch();
+        app
+    }
+
+    /// The active preset's gain, but never above `LAUNCH_GAIN_CAP_DB`: a
+    /// loud preset left active must not blast the next launch. Its output is
+    /// picked too; `start` falls back if that device is not plugged in.
+    fn apply_active_preset_at_launch(&mut self) {
+        let Some(preset) = self.presets.active().cloned() else {
+            return;
+        };
+        let gain = self.clamp_gain(preset.gain_db).min(LAUNCH_GAIN_CAP_DB);
+        self.set_gain_db(gain);
+        if let Some(device) = preset.output_device
+            && let Err(error) = self
+                .settings
+                .update(|s| s.output_device_id = Some(device.id))
+        {
+            log::error!("Saving settings failed: {error:#}");
+        }
+    }
+
+    /// Clamps a gain to the slider's range, which depends on the unlock
+    /// setting.
+    pub fn clamp_gain(&self, db: f32) -> f32 {
+        db.clamp(dsp::GAIN_MIN_DB, self.settings.get().max_gain_db())
+    }
+
+    /// Loads a preset: its gain through the smoother - never a jump - and
+    /// its output if it names one that is connected. A preset whose output
+    /// is unplugged keeps the current one, and says so.
+    pub fn load_preset(&mut self, id: Uuid) {
+        let preset = match self.presets.set_active(id) {
+            Ok(preset) => preset.clone(),
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return;
+            }
+        };
+        self.set_gain_db(self.clamp_gain(preset.gain_db));
+        let Some(wanted) = preset.output_device else {
+            return;
+        };
+        let found = self
+            .devices
+            .outputs
+            .iter()
+            .find(|d| d.id == wanted.id)
+            .or_else(|| {
+                self.devices
+                    .outputs
+                    .iter()
+                    .find(|d| !wanted.name.is_empty() && d.name == wanted.name)
+            })
+            .map(|d| d.id.clone());
+        match found {
+            Some(id) => {
+                if self.settings.get().output_device_id.as_deref() != Some(id.as_str()) {
+                    self.choose_output(Some(id));
+                }
+            }
+            None => {
+                let name = if wanted.name.is_empty() {
+                    "Its output device"
+                } else {
+                    wanted.name.as_str()
+                };
+                self.notice = Some(format!(
+                    "{name} is not connected, so {} kept the current output.",
+                    preset.name
+                ));
+            }
+        }
+    }
+
+    /// The output as a preset would save it: `None` for "your usual output".
+    pub fn current_device_ref(&self) -> Option<DeviceRef> {
+        let id = self.settings.get().output_device_id?;
+        let name = self
+            .devices
+            .outputs
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.name.clone())
+            .or_else(|| {
+                // Unplugged: keep the name the active preset already knows.
+                self.presets
+                    .active()
+                    .and_then(|p| p.output_device.as_ref())
+                    .filter(|d| d.id == id)
+                    .map(|d| d.name.clone())
+            })
+            .unwrap_or_default();
+        Some(DeviceRef { id, name })
+    }
+
+    /// True when the gain differs from the active preset's, or the output
+    /// does and the preset names one: the panel then marks it with a dot and
+    /// offers Save. A preset with no output - the built-ins - plays wherever
+    /// boost is playing, so the output never makes it modified.
+    pub fn preset_modified(&self) -> bool {
+        let Some(preset) = self.presets.active() else {
+            return false;
+        };
+        let output = self.settings.get().output_device_id;
+        (self.gain_db - self.clamp_gain(preset.gain_db)).abs() > GAIN_EPSILON_DB
+            || preset
+                .output_device
+                .as_ref()
+                .is_some_and(|d| Some(&d.id) != output.as_ref())
+    }
+
+    /// "Save": the current settings into the active preset. One with no
+    /// output stays that way; "Save as new" is how to tie one to a device.
+    pub fn save_active_preset(&mut self) {
+        let Some(preset) = self.presets.active() else {
+            return;
+        };
+        let id = preset.id;
+        let output = if preset.output_device.is_some() {
+            self.current_device_ref()
+        } else {
+            None
+        };
+        if let Err(error) = self.presets.update(id, self.gain_db, output) {
+            self.notice = Some(error.to_string());
+        }
+    }
+
+    /// "Save as new": a new preset from the current settings, made active.
+    /// The error is the name's, for the panel to show beside the field.
+    pub fn save_preset_as(&mut self, name: &str) -> Result<(), String> {
+        let output = self.current_device_ref();
+        self.presets
+            .create(name, self.gain_db, output)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn rename_preset(&mut self, id: Uuid, name: &str) -> Result<(), String> {
+        self.presets.rename(id, name).map_err(|e| e.to_string())
+    }
+
+    pub fn duplicate_preset(&mut self, id: Uuid) {
+        if let Err(error) = self.presets.duplicate(id) {
+            self.notice = Some(error.to_string());
+        }
+    }
+
+    pub fn delete_preset(&mut self, id: Uuid) {
+        if let Err(error) = self.presets.delete(id) {
+            self.notice = Some(error.to_string());
         }
     }
 
@@ -309,6 +497,14 @@ fn end_routing(settings: &SharedSettings) -> anyhow::Result<engine::routing::Res
         s.original_default_device_id = None;
     })?;
     Ok(restored)
+}
+
+/// Both messages, one after the other, or whichever there is.
+fn join_notices(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}\n\n{second}")),
+        (first, second) => first.or(second),
+    }
 }
 
 fn dbfs(peak: f32) -> f32 {

@@ -1,13 +1,15 @@
 //! Preset data model and versioned JSON storage.
 //!
-//! A preset is a named snapshot of gain, limiter settings and output device.
-//! All presets live in one versioned `presets.json` under `%APPDATA%`.
-//!
-//! Filled in by coding-order step 9 (Presets).
+//! A preset is a named snapshot of gain and output device. All presets live
+//! in one versioned `presets.json` under `%APPDATA%`, next to the app's
+//! `settings.json`.
 
 pub mod migrate;
 pub mod model;
 pub mod store;
+
+pub use model::{DeviceRef, Preset, PresetFile};
+pub use store::{LoadOutcome, PresetError, PresetStore};
 
 /// Qualifier, organisation and application passed to
 /// `directories::ProjectDirs`, which resolves `presets.json`'s folder.

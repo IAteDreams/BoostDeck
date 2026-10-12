@@ -25,3 +25,4 @@ directories.workspace = true
 log.workspace = true
 simplelog.workspace = true
 anyhow.workspace = true
+uuid.workspace = true
