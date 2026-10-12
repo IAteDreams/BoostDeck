@@ -42,6 +42,18 @@ const ROLES: [ERole; 2] = [eConsole, eMultimedia];
 /// [`route_to_cable`], cleared by [`restore`].
 static RESTORE_ON_PANIC: Mutex<Option<String>> = Mutex::new(None);
 
+/// Where the routing record lives: `routing_active` and
+/// `original_default_device_id` in the app's `settings.json`. The control
+/// thread owns one and calls it around every switch, so the record is always
+/// written before the default changes and cleared after it changes back.
+pub trait RoutingJournal: Send {
+    /// The original an earlier run recorded and never cleared, if any.
+    fn saved_original(&self) -> Option<String>;
+    /// `Some(id)`: a route to undo, saved with `routing_active: true`.
+    /// `None`: nothing to undo any more.
+    fn record(&mut self, original: Option<&str>) -> Result<()>;
+}
+
 /// Where the default output went when boost was turned on.
 #[derive(Debug, Clone)]
 pub struct Route {

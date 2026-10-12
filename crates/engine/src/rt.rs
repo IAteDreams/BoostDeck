@@ -122,6 +122,13 @@ impl Shared {
         self.stop.load(Ordering::Relaxed)
     }
 
+    /// Re-arms the threads after a stop, so the control thread can start a
+    /// new pair on the same `Shared` - and keep the UI's gain - after a
+    /// rebuild. Only call it once both old threads have been joined.
+    pub fn clear_stop(&self) {
+        self.stop.store(false, Ordering::Relaxed);
+    }
+
     /// Called from a real-time thread on the way out. Keeps the first error
     /// rather than the last: that is the one that explains the rest.
     pub fn set_error(&self, error: RtError) {

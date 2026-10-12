@@ -4,11 +4,16 @@
 //!
 //! ```text
 //! cargo run -p engine --example devices
+//! cargo run -p engine --example devices -- --set-default Realtek
 //! ```
 //!
 //! It should print an id for CABLE Input, an id for CABLE Output, and an id
 //! for your real speakers. That is also the quickest check that a VB-Cable
 //! install is visible to WASAPI at all.
+//!
+//! `--set-default <id or name fragment>` first makes any render device - the
+//! cable included - the Console and Multimedia default, the way a user would
+//! in Sound settings. It is for testing how BoostDeck reacts to that.
 
 use anyhow::{Context as _, Result};
 use engine::devices::{self, CableEndpoints, DeviceInfo};
@@ -17,6 +22,18 @@ use wasapi::{DeviceEnumerator, Direction, Role, initialize_mta};
 fn main() -> Result<()> {
     initialize_mta().ok().context("initialising COM (MTA)")?;
     let enumerator = DeviceEnumerator::new().context("creating the device enumerator")?;
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, wanted] = args.as_slice()
+        && flag == "--set-default"
+    {
+        let device = devices::list(&enumerator, Direction::Render)?
+            .into_iter()
+            .find(|d| d.id == *wanted || d.name.contains(wanted.as_str()))
+            .with_context(|| format!("no render device matches {wanted:?}"))?;
+        engine::routing::set_default_output(&device.id)?;
+        println!("Default output set to {}", device.name);
+    }
 
     for direction in [Direction::Render, Direction::Capture] {
         let devices = devices::list(&enumerator, direction)?;

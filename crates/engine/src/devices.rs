@@ -112,6 +112,14 @@ pub fn default_device(
     }
 }
 
+/// One endpoint by id, in any state, or `None` if Windows no longer knows it.
+pub fn by_id(enumerator: &DeviceEnumerator, id: &str) -> Result<Option<DeviceInfo>> {
+    match enumerator.get_device(id) {
+        Ok(device) => Ok(Some(DeviceInfo::read(&device)?)),
+        Err(_) => Ok(None),
+    }
+}
+
 /// The two VB-Cable endpoints, each present or not.
 #[derive(Debug, Clone, Default)]
 pub struct CableEndpoints {
