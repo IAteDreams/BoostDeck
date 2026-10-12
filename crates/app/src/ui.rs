@@ -11,6 +11,14 @@ pub fn draw(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
     ui.heading("BoostDeck");
     ui.label(format!("Status: {}", app.status.label()));
 
+    if let Some(notice) = &app.notice {
+        ui.separator();
+        ui.label(notice);
+        if ui.button("OK").clicked() {
+            app.notice = None;
+        }
+    }
+
     ui.separator();
 
     ui.label("Skeleton build - the audio path is not wired up yet.");
@@ -28,5 +36,5 @@ pub fn draw(app: &mut BoostDeckApp, ui: &mut egui::Ui) {
 
     ui.separator();
 
-    ui.label("Next: step 2, list the audio devices and find VB-Cable.");
+    ui.label("Next: step 7, the control thread.");
 }

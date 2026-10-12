@@ -1,7 +1,8 @@
 //! BoostDeck desktop app.
 //!
-//! Coding-order step 1 (Skeleton): this opens the window and nothing else. The
-//! audio engine, presets and the real controls arrive in steps 3 through 10.
+//! Opens the window. On launch it first undoes a default-output switch left
+//! behind by a run that was killed or crashed (step 6); the audio engine,
+//! presets and the real controls arrive in steps 7 through 10.
 
 // No console window in release builds (README "Packaging"), but keep one in
 // debug builds so `log` output and panics stay visible while developing.
@@ -16,6 +17,12 @@ use state::BoostDeckApp;
 fn main() -> eframe::Result {
     init_logging();
     log::info!("BoostDeck {} starting", env!("CARGO_PKG_VERSION"));
+    // Before anything can route: a panic while the cable is the default puts
+    // the user's device back on the way down.
+    engine::routing::install_panic_hook();
+    // Built before the window opens, so a leftover route from a killed run
+    // is undone even if the window never appears.
+    let app = BoostDeckApp::new();
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -25,11 +32,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
-        "BoostDeck",
-        options,
-        Box::new(|_cc| Ok(Box::<BoostDeckApp>::default())),
-    )
+    eframe::run_native("BoostDeck", options, Box::new(|_cc| Ok(Box::new(app))))
 }
 
 /// Logging goes to the terminal for now. Step 11 moves it to a rolling file

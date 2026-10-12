@@ -32,5 +32,13 @@ features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_Threading",
 ]
+
+[dev-dependencies]
+# The passthrough example's `--route` writes the routing record into the
+# app's settings.json, so a killed run is recovered by the next app launch.
+presets.workspace = true
+serde_json.workspace = true
+directories.workspace = true
