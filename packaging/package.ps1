@@ -34,7 +34,7 @@ Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
 
 if (Get-Command wix -ErrorAction SilentlyContinue) {
     $msi = Join-Path $dist "BoostDeck-$version-x64.msi"
-    wix build packaging\boostdeck.wxs -arch x64 -d Version=$version -d StageDir=$stage -o $msi
+    wix build packaging\boostdeck.wxs -arch x64 -d Version=$version -d StageDir=$stage -d IconFile=$root\assets\boostdeck.ico -o $msi
     if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
     Remove-Item -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($msi, ".wixpdb"))
     "Installer: $msi"
