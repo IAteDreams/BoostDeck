@@ -1,0 +1,56 @@
+<!--
+  BoostDeck's MSI, for the WiX Toolset v5 (wix.exe). Built by
+  packaging/package.ps1, which passes:
+    Version   the crate version, e.g. 0.1.0
+    StageDir  the folder holding boostdeck.exe, README.txt and LICENSE.txt
+
+  Installs for all users into Program Files\BoostDeck with a Start menu
+  shortcut. Settings, presets and logs live in the user's profile and are
+  left in place on uninstall. The UpgradeCode must never change: it is how
+  a newer MSI finds and replaces an older one.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="BoostDeck"
+           Manufacturer="BoostDeck"
+           Version="$(var.Version)"
+           UpgradeCode="7EF8AD7F-4FF5-47A9-B365-BAE0315508C3"
+           Scope="perMachine"
+           Compressed="yes">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of BoostDeck is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Taken from the exe, which carries the icon (crates/app/build.rs): an
+         advertised shortcut needs an icon named like its target, ICE50. -->
+    <Icon Id="BoostDeck.exe" SourceFile="$(var.StageDir)\boostdeck.exe" />
+    <Property Id="ARPPRODUCTICON" Value="BoostDeck.exe" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/IAteDreams/BoostDeck" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="BoostDeck" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Component>
+        <File Source="$(var.StageDir)\boostdeck.exe" KeyPath="yes">
+          <Shortcut Name="BoostDeck"
+                    Description="Boost every app's sound past 100%"
+                    Directory="ProgramMenuFolder"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="BoostDeck.exe"
+                    Advertise="yes" />
+        </File>
+      </Component>
+      <Component>
+        <File Source="$(var.StageDir)\README.txt" />
+      </Component>
+      <Component>
+        <File Source="$(var.StageDir)\LICENSE.txt" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="AppFiles" />
+    </Feature>
+  </Package>
+</Wix>
