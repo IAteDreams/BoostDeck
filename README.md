@@ -283,7 +283,7 @@ routing, the UI and presets.
 - [x] **3. Pass-through spike.** CABLE Input set as default by hand; capture → ring → render at unity gain, no GUI. *Done when:* a video plays through for 10 minutes with no crackles.
 - [ ] **4. DSP crate.** Gain, soft clip, limiter, meters, unit tests; plugged into the spike at +6 dB. *Done when:* tests prove output never exceeds the ceiling and the boost is audible.
 - [x] **5. Drift correction.** Ring-fill tracking and drop/repeat correction, fill logged every 5 s. *Done when:* a 2-hour run holds fill within ±10 ms of target with zero underruns.
-- [ ] **6. Routing.** `IPolicyConfig` switch, save original, restore on exit, panic hook, recovery on next launch. *Done when:* killing the process in Task Manager and relaunching restores your speakers as default.
+- [x] **6. Routing.** `IPolicyConfig` switch, save original, restore on exit, panic hook, recovery on next launch. *Done when:* killing the process in Task Manager and relaunching restores your speakers as default.
 - [ ] **7. Control thread.** Commands, events, device notifications, rebuild with backoff. *Done when:* unplugging headphones, changing the sample rate, and sleep/resume all recover without a restart.
 - [ ] **8. GUI.** Status line, on/off, slider, meters, output picker, setup screen, wired to the engine. *Done when:* everything in steps 3–7 works from the window.
 - [ ] **9. Presets.** `presets` crate, storage, panel, built-ins. *Done when:* create, rename, duplicate, delete and load all work, and a hand-corrupted `presets.json` recovers from the backup.
