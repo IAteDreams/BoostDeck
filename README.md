@@ -149,6 +149,7 @@ build compile but their types do not mix.
 cargo build                          # debug build
 cargo clippy                         # lints
 cargo run -p app                     # launch the GUI
+cargo run -p engine --example devices # list endpoints, check VB-Cable
 cargo test                           # pure-Rust tests, any machine
 cargo test --features device-tests   # also hits real devices; needs VB-Cable
 cargo build --release                # release build
@@ -240,7 +241,9 @@ Declare the undocumented `IPolicyConfig` COM interface yourself against `windows
 **before** switching. Leave the **Communications** role alone. Restore the original from a
 panic hook (`std::panic::set_hook`) and from eframe's `on_exit`; on launch, if
 `routing_active` is still true, the last run did not clean up — restore immediately and
-say why. Never allow CABLE Input to be picked as BoostDeck's own output.
+say why. Never offer a VB-Audio virtual cable as BoostDeck's own output: CABLE Input
+would feed the cable back into itself, and the extra variants an install ships
+(`CABLE In 16ch`, `Cable A`) send audio somewhere nothing is listening.
 
 **Device changes** go to the control thread only; the RT threads raise a flag and exit.
 Windows calls device notifications on its own threads, so each callback just posts a
@@ -261,7 +264,7 @@ Build the audio path first without any GUI, prove it is stable for hours, then w
 routing, the UI and presets.
 
 - [x] **1. Skeleton.** Workspace, four crates, `cargo run -p app` opens an empty eframe window. *Done when:* `cargo build` and `cargo clippy` pass.
-- [ ] **2. Device list.** A CLI in `engine/examples/` listing render and capture devices. *Done when:* it prints both CABLE ids and your speakers' id.
+- [x] **2. Device list.** A CLI in `engine/examples/` listing render and capture devices. *Done when:* it prints both CABLE ids and your speakers' id.
 - [ ] **3. Pass-through spike.** CABLE Input set as default by hand; capture → ring → render at unity gain, no GUI. *Done when:* a video plays through for 10 minutes with no crackles.
 - [ ] **4. DSP crate.** Gain, soft clip, limiter, meters, unit tests; plugged into the spike at +6 dB. *Done when:* tests prove output never exceeds the ceiling and the boost is audible.
 - [ ] **5. Drift correction.** Ring-fill tracking and drop/repeat correction, fill logged every 5 s. *Done when:* a 2-hour run holds fill within ±10 ms of target with zero underruns.
