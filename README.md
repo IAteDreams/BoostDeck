@@ -2,8 +2,10 @@
 
 Boost every app's sound past 100% on Windows, with an always-on limiter so nothing clips.
 
-> **Status: pre-implementation.** The MVP is being built; no crates are committed yet.
-> See [Coding order](#coding-order) for what lands in which step.
+> **Status: 1.0.0 released.** All eleven steps of the [coding order](#coding-order) are
+> done. Download the installer or the portable zip from
+> [Releases](https://github.com/IAteDreams/BoostDeck/releases/latest), and install
+> [VB-Cable](#setting-up-vb-cable) first.
 
 BoostDeck works in **cable mode**: it routes all Windows audio through a virtual cable
 (VB-Cable), processes it, and plays the result on your real speakers or headphones. No
@@ -319,6 +321,75 @@ powershell -ExecutionPolicy Bypass -File packaging/package.ps1
 Without signing, users see "Windows protected your PC" on first run (More info → Run
 anyway). On PCs with Smart App Control turned on the unsigned installer is blocked; those
 users need the portable zip, or a signed build later.
+
+### Branches, pull requests and releases
+
+`main` is protected by a GitHub ruleset: every change reaches it through a pull request,
+and force pushes and deleting `main` are blocked. Nobody pushes to `main` directly.
+
+**Every change** is made on its own branch (`feat/…`, `fix/…`, `chore/…`, `docs/…`) and
+landed by the `/merge-to-main` skill in Claude Code
+(`.claude/skills/merge-to-main/SKILL.md`), which:
+
+1. Checks the branch is clean, up to date with `main`, and adds something.
+2. Runs the gate: `cargo build`, `cargo clippy --workspace --all-targets -- -D warnings`,
+   `cargo test --workspace`. A failure stops the merge.
+3. Writes a branch log to `docs/<branch>-branch-log.md` (commits, files, every check that
+   ran, notes) and commits it on the branch, ticking any coding-order step the branch
+   finished.
+4. Pushes the branch, opens a pull request, and merges it with a **merge commit** once
+   GitHub reports it clean. Merge commits keep the branch's commits as they are, so the
+   shas in the branch log stay valid; squash and rebase merges would rewrite them.
+5. Pulls `main` and deletes the branch, locally and on GitHub.
+
+By hand, steps 4 and 5 are:
+
+```sh
+git push -u origin <branch>
+gh pr create --base main --head <branch> --title "<subject>" --body-file <notes>
+gh pr merge <n> --merge --delete-branch
+git checkout main && git pull --ff-only origin main
+```
+
+**A release** is the same flow in release mode: `/merge-to-main release X.Y.Z`. Versions
+follow semver, and the tag is `vX.Y.Z`. It:
+
+1. Checks the version is higher than the current one and that neither the tag nor the
+   release exists yet, and that the WiX Toolset is installed.
+2. On a branch `chore/release-X.Y.Z`, sets `version = "X.Y.Z"` under
+   `[workspace.package]` in `Cargo.toml`. The `.exe`'s version information, the MSI and
+   the file names all come from there.
+3. Runs the gate, then `packaging/package.ps1`, and checks what it built:
+   - the `.exe` reports version X.Y.Z;
+   - `wix msi validate` reports no errors and no warnings;
+   - the MSI unpacked with `msiexec /a` holds exactly `boostdeck.exe`, `README.txt` and
+     `LICENSE.txt`, with the `.exe` byte-identical to the release build;
+   - the MSI is smaller than the `.exe` (larger means something is in it twice);
+   - SHA-256 checksums of both files, for the release notes.
+4. If anything under `packaging/`, `assets/` or `crates/app/build.rs` changed since the
+   last release, offers an install test: install with `msiexec /i` (an admin prompt),
+   check Program Files, the Start menu shortcut and Apps & features, launch from the
+   shortcut, then uninstall and confirm settings and presets survive.
+5. Lands the release branch through a pull request titled `Release X.Y.Z`.
+6. Confirms `main` holds exactly the tree the packages were built from, tags the merge
+   commit with an annotated `vX.Y.Z`, and pushes the tag.
+7. Publishes the GitHub release with both files attached and notes covering the
+   downloads, the VB-Cable requirement, what is new, the unsigned-build warning, safety,
+   known limitations and the checksums. It then downloads both files back and compares
+   checksums.
+
+By hand, steps 6 and 7 are:
+
+```sh
+git tag -a vX.Y.Z <merge commit> -m "BoostDeck X.Y.Z"
+git push origin vX.Y.Z
+gh release create vX.Y.Z dist/BoostDeck-X.Y.Z-x64.msi dist/BoostDeck-X.Y.Z-portable.zip \
+  --title "BoostDeck X.Y.Z" --notes-file <notes> --verify-tag
+```
+
+Before a release, also run the manual checks under [Build and test](#build-and-test).
+A published tag is never moved or deleted: if a release turns out to be broken, fix it in
+a patch release (`X.Y.Z+1`).
 
 ## Reference
 
