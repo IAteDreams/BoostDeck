@@ -1,0 +1,12 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local Cargo state
+.cargo/config.local.toml
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

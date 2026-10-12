@@ -106,7 +106,7 @@ on any machine, and all Windows code lives in one place.
 ```
 boostdeck/
 ├─ Cargo.toml              # workspace root
-├─ rust-toolchain.toml     # channel = "1.95" (or newer stable)
+├─ rust-toolchain.toml     # channel = "stable"; the 1.95 floor is in Cargo.toml
 ├─ crates/
 │  ├─ app/                 # binary: eframe GUI, wiring, settings
 │  │  └─ src/ main.rs, ui.rs, state.rs, settings.rs
@@ -134,7 +134,7 @@ Versions as of October 2026 — run `cargo update` when you start.
 | `serde` + `serde_json` | 1 | presets, app | Preset and settings files |
 | `directories` | 6 | presets, app | `%APPDATA%` paths |
 | `uuid` | 1 (`v4`, `serde`) | presets | Preset ids |
-| `log` + `simplelog` | 0.4 / 0.12 | all | File logging (never on audio threads) |
+| `log` + `simplelog` | 0.4 / 0.12 | app, engine, presets | File logging; never in `dsp`, which must not log on the audio threads |
 | `anyhow` / `thiserror` | 1 / 2 | all | Errors |
 
 Keep `windows` pinned to 0.62 so it matches what `wasapi` 0.26 uses; two versions in one
@@ -260,7 +260,7 @@ Quiet videos +6 dB, Max +12 dB) and tell the user.
 Build the audio path first without any GUI, prove it is stable for hours, then wrap it in
 routing, the UI and presets.
 
-- [ ] **1. Skeleton.** Workspace, four crates, `cargo run -p app` opens an empty eframe window. *Done when:* `cargo build` and `cargo clippy` pass.
+- [x] **1. Skeleton.** Workspace, four crates, `cargo run -p app` opens an empty eframe window. *Done when:* `cargo build` and `cargo clippy` pass.
 - [ ] **2. Device list.** A CLI in `engine/examples/` listing render and capture devices. *Done when:* it prints both CABLE ids and your speakers' id.
 - [ ] **3. Pass-through spike.** CABLE Input set as default by hand; capture → ring → render at unity gain, no GUI. *Done when:* a video plays through for 10 minutes with no crackles.
 - [ ] **4. DSP crate.** Gain, soft clip, limiter, meters, unit tests; plugged into the spike at +6 dB. *Done when:* tests prove output never exceeds the ceiling and the boost is audible.
@@ -276,7 +276,8 @@ routing, the UI and presets.
 
 The MVP ships unsigned as a portable zip plus an MSI.
 
-- Add `#![windows_subsystem = "windows"]` to `app/src/main.rs` so no console window opens.
+- `app/src/main.rs` carries `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`,
+  so release builds open no console window while debug builds keep one for logs.
 - In the workspace `Cargo.toml`: `[profile.release] opt-level = 3`, `lto = "thin"`,
   `codegen-units = 1`. Keep the default `panic = "unwind"`.
 - Embed an app icon with a resource crate such as `embed-resource`.

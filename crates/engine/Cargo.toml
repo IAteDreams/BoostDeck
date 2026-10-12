@@ -1,0 +1,36 @@
+[package]
+name = "engine"
+description = "Windows-only audio engine: WASAPI capture and render, device routing, control thread."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# Tests that need real devices and VB-Cable installed; off by default so
+# `cargo test` stays green on any machine.
+device-tests = []
+
+[dependencies]
+dsp.workspace = true
+rtrb.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+wasapi.workspace = true
+windows-core.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+]

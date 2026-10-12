@@ -1,0 +1,7 @@
+# The build guide pins "1.95 (or newer stable)". Tracking stable keeps the
+# toolchain current; the 1.95 floor is enforced by `rust-version` in
+# Cargo.toml, so cargo errors out on anything older.
+[toolchain]
+channel = "stable"
+targets = ["x86_64-pc-windows-msvc"]
+components = ["clippy", "rustfmt"]

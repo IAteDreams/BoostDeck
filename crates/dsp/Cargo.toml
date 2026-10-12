@@ -1,0 +1,14 @@
+[package]
+name = "dsp"
+description = "Gain, soft clip, limiter, meters and drift correction. Pure Rust, no allocation while processing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# No dependencies on purpose: this crate must stay pure Rust so it builds and
+# tests on any machine, and it must not log or allocate on the audio threads.
+[dependencies]

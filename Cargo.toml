@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/app", "crates/engine", "crates/dsp", "crates/presets"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+authors = ["Allain Jhandred Frio Quilala"]
+repository = "https://github.com/IAteDreams/BoostDeck"
+
+# Versions as of October 2026; see README "Dependencies".
+# Keep `windows` pinned to 0.62 so it matches what `wasapi` 0.26 uses:
+# two versions in one build compile, but their types do not mix.
+[workspace.dependencies]
+wasapi = "0.26"
+windows = "0.62"
+windows-core = "0.62"
+rtrb = "0.4"
+crossbeam-channel = "0.5"
+eframe = "0.36"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+log = "0.4"
+simplelog = "0.12"
+anyhow = "1"
+thiserror = "2"
+
+dsp = { path = "crates/dsp" }
+engine = { path = "crates/engine" }
+presets = { path = "crates/presets" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Keep the default unwind: the panic hook restores the Windows default
+# output device before the process dies (README "Default device routing").
+panic = "unwind"
