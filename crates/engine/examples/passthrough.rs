@@ -32,7 +32,10 @@ const REPORT_EVERY: Duration = Duration::from_secs(5);
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let run_for: Option<u64> = match args.next() {
-        Some(arg) => Some(arg.parse().context("the first argument is seconds to run")?),
+        Some(arg) => Some(
+            arg.parse()
+                .context("the first argument is seconds to run")?,
+        ),
         None => None,
     };
     let output_id = args.next();

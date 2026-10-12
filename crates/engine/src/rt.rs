@@ -81,8 +81,9 @@ pub struct Shared {
     /// before it ever reached us.
     discontinuities: AtomicU64,
 
-    /// How much audio is waiting in the ring, in frames. Drift correction
-    /// steers this toward its target in step 5.
+    /// How much audio is left in the ring just after the render thread has
+    /// served the device, in frames: the margin before an underrun. Drift
+    /// correction steers this toward its target in step 5.
     ring_fill_frames: AtomicU32,
 }
 

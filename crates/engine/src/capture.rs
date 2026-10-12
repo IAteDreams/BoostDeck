@@ -116,13 +116,7 @@ fn run_inner(config: CaptureConfig, mut producer: Producer<f32>, shared: &Shared
         .start_stream()
         .context("starting the capture stream")?;
 
-    let outcome = capture_loop(
-        &capture_client,
-        &event,
-        &mut staging,
-        &mut producer,
-        shared,
-    );
+    let outcome = capture_loop(&capture_client, &event, &mut staging, &mut producer, shared);
 
     // Stop even when the loop failed, so the endpoint is released either way.
     let _ = audio_client.stop_stream();

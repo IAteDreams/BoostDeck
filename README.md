@@ -225,12 +225,13 @@ reaches target. VB-Cable and the speakers run on separate clocks, so track ring 
 ~1 s moving average and, when it strays more than 10 ms from target, drop or repeat one
 frame per 1,000 frames until it returns.
 
-On priming, the ring is also trimmed down to the target (never below the buffer the device
-is asking for). The cable hands over a backlog while the render stream is still opening,
-and because capture and render then both run at the device rate, a ring that starts full
-*stays* full — a stable equilibrium at the worst possible latency. Trimming once, before
-the first sample is played, is inaudible; ongoing drift is corrected a frame at a time
-instead.
+Priming keeps the speakers silent while it plays the ring into the void, one device period at
+a time, pulling only when the target would still be left afterwards; after ~100 ms in step it
+goes live. That settles at the target whichever of capture and render wakes first on the
+engine tick. The cable hands over a backlog while the render stream is still opening, and
+because capture and render then both run at the device rate, a ring that starts full *stays*
+full — a stable equilibrium at the worst possible latency. Discarding it before the first
+sample is played is inaudible; ongoing drift is corrected a frame at a time instead.
 
 **Latency budget at 48 kHz** (estimates — measure your own)
 

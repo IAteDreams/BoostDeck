@@ -25,6 +25,10 @@ const EVENT_TIMEOUT_MS: u32 = 2_000;
 /// Spare room in the byte staging queue, as a multiple of one device buffer.
 const STAGING_BUFFERS: usize = 8;
 
+/// Consecutive in-step device events before playback starts: about 100 ms at
+/// a 10 ms period, long enough for capture and render to fall into step.
+const SETTLE_TICKS: u32 = 10;
+
 pub struct RenderConfig {
     /// Endpoint id of the real output device. Never a virtual cable: see
     /// `devices::output_candidates`.
@@ -136,34 +140,40 @@ fn render_loop(
     shared: &Shared,
     target_fill_frames: u32,
 ) -> Result<()> {
-    // Silence goes out until the ring has filled to its target once. Starting
-    // to pull from a nearly empty ring would underrun immediately.
+    // Silence goes out until the ring has settled at its target; see
+    // `settle_tick`. Starting to pull from a nearly empty ring would underrun
+    // immediately.
     let mut primed = false;
+    let mut settled_ticks = 0u32;
+    let buffer_frames = audio_client
+        .get_buffer_size()
+        .context("reading the render buffer size")? as usize;
 
     while !shared.should_stop() {
         let frames = audio_client
             .get_available_space_in_frames()
             .context("reading the available render space")? as usize;
 
-        let queued_frames = consumer.slots() / CHANNELS as usize;
-        shared.set_ring_fill_frames(queued_frames as u32);
-
-        if !primed && queued_frames >= target_fill_frames as usize {
-            primed = true;
-            // Never trim below the buffer the device is asking for right now:
-            // that first request can be larger than the target, and cutting to
-            // the target exactly would underrun on the very first pull.
-            trim_to_target(consumer, target_fill_frames.max(frames as u32));
-            // Everything counted so far belongs to filling the ring, not to
-            // playback. Reset so the totals describe the steady state.
-            shared.reset_counters();
-        }
-
         if primed {
             copy_to_staging(staging, consumer, shared, frames);
         } else {
+            settled_ticks = if settle_tick(consumer, frames, buffer_frames, target_fill_frames) {
+                settled_ticks + 1
+            } else {
+                0
+            };
+            if settled_ticks >= SETTLE_TICKS {
+                primed = true;
+                // Everything counted so far belongs to filling the ring, not
+                // to playback. Reset so the totals describe the steady state.
+                shared.reset_counters();
+            }
             fill_with_silence(staging, frames);
         }
+
+        // Measured after the pull: this is the low-water mark, the margin left
+        // for the next capture packet, and the number the target describes.
+        shared.set_ring_fill_frames((consumer.slots() / CHANNELS as usize) as u32);
 
         render_client
             .write_to_device_from_deque(frames, staging, None)
@@ -176,6 +186,35 @@ fn render_loop(
     Ok(())
 }
 
+/// One device event of priming. Plays the ring into the void - pulls the
+/// request and discards it while the device gets silence - but only when the
+/// target would still be left afterwards. Returns whether it pulled.
+///
+/// Capture and render wake on the same engine tick, in either order. Priming
+/// with a single trim locked in whichever order that one tick happened to
+/// have, so a run settled a whole capture packet (10 ms) short about half the
+/// time, for good. Pulling only when target + request is there makes the
+/// ring settle at the target after the pull whatever the order: if capture
+/// has not delivered yet, this tick waits and the next one is in step.
+///
+/// The device's first requests fill its whole buffer (1,056 frames on a
+/// Realtek at 48 kHz) and are not a period; they are skipped.
+fn settle_tick(
+    consumer: &mut Consumer<f32>,
+    frames: usize,
+    buffer_frames: usize,
+    target_fill_frames: u32,
+) -> bool {
+    let in_rhythm = frames > 0 && frames < buffer_frames;
+    let keep_frames = target_fill_frames as usize + frames;
+    if !in_rhythm || consumer.slots() / (CHANNELS as usize) < keep_frames {
+        return false;
+    }
+    // Any startup backlog goes too: see `trim_to_target`.
+    trim_to_target(consumer, target_fill_frames);
+    true
+}
+
 /// Drops everything in the ring past `keep_frames`.
 ///
 /// At startup the ring can be far past target: the cable hands over a backlog
@@ -184,9 +223,9 @@ fn render_loop(
 /// is a stable equilibrium at the worst possible latency - a nearly full
 /// half-second ring measured 488 ms of delay before this was added.
 ///
-/// Discarding is audible in principle, but this runs once, before the first
-/// sample is played. Ongoing drift is corrected a frame at a time in step 5,
-/// which is inaudible; this is deliberately not that.
+/// Discarding is audible in principle, but this only runs while priming, before
+/// the first sample is played. Ongoing drift is corrected a frame at a time in
+/// step 5, which is inaudible; this is deliberately not that.
 fn trim_to_target(consumer: &mut Consumer<f32>, keep_frames: u32) {
     let target_samples = keep_frames as usize * CHANNELS as usize;
     while consumer.slots() > target_samples {
@@ -328,6 +367,95 @@ mod tests {
         trim_to_target(&mut consumer, 20);
 
         assert_eq!(consumer.slots(), 10);
+    }
+
+    /// Simulates priming from a full ring, one engine tick at a time, with
+    /// capture delivering either before or after render on every tick. Returns
+    /// the ring fill, in frames, right after each render pull once settled.
+    /// `missed_tick` drops one capture packet, as capture did live while it
+    /// was still catching up after the startup backlog.
+    fn settle_then_play(capture_first: bool, missed_tick: Option<usize>) -> Vec<usize> {
+        const PACKET: usize = 480;
+        const BUFFER: usize = 1_056;
+        const TARGET: u32 = 960;
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(48_000);
+        while producer.push(0.5).is_ok() {}
+
+        let deliver = |producer: &mut rtrb::Producer<f32>, tick: usize| {
+            if missed_tick == Some(tick) {
+                return;
+            }
+            for _ in 0..PACKET * CHANNELS as usize {
+                let _ = producer.push(0.5);
+            }
+        };
+
+        // The whole-buffer fill, then the empty request after it.
+        let mut requests = vec![BUFFER, 0];
+        requests.extend([PACKET; 40]);
+
+        let mut settled = 0;
+        let mut after_pull = Vec::new();
+        for (tick, frames) in requests.into_iter().enumerate() {
+            if capture_first {
+                deliver(&mut producer, tick);
+            }
+            if settled < SETTLE_TICKS {
+                settled = if settle_tick(&mut consumer, frames, BUFFER, TARGET) {
+                    settled + 1
+                } else {
+                    0
+                };
+            } else {
+                for _ in 0..frames * CHANNELS as usize {
+                    consumer.pop().expect("the ring ran dry: an underrun");
+                }
+                after_pull.push(consumer.slots() / CHANNELS as usize);
+            }
+            if !capture_first {
+                deliver(&mut producer, tick);
+            }
+        }
+        after_pull
+    }
+
+    /// The order capture and render wake in on the priming tick must not
+    /// decide the margin for the rest of the run.
+    #[test]
+    fn priming_settles_at_target_whichever_thread_runs_first() {
+        for capture_first in [true, false] {
+            let after_pull = settle_then_play(capture_first, None);
+            assert!(!after_pull.is_empty(), "never left priming");
+            assert!(
+                after_pull.iter().all(|&fill| fill == 960),
+                "capture_first={capture_first}: {after_pull:?}"
+            );
+        }
+    }
+
+    /// A packet capture misses while priming is made up before playback,
+    /// rather than costing a period of margin for the rest of the run.
+    #[test]
+    fn a_packet_missed_while_settling_is_not_locked_in() {
+        for capture_first in [true, false] {
+            for missed in 2..8 {
+                let after_pull = settle_then_play(capture_first, Some(missed));
+                assert!(
+                    after_pull.iter().all(|&fill| fill == 960),
+                    "capture_first={capture_first} missed={missed}: {after_pull:?}"
+                );
+            }
+        }
+    }
+    /// The whole-buffer fill is not a period and must never prime.
+    #[test]
+    fn the_initial_buffer_fill_does_not_count_as_settled() {
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(48_000);
+        while producer.push(0.5).is_ok() {}
+
+        assert!(!settle_tick(&mut consumer, 1_056, 1_056, 960));
+        assert!(!settle_tick(&mut consumer, 0, 1_056, 960));
+        assert_eq!(consumer.slots(), 48_000, "nothing pulled outside a period");
     }
 
     /// Unity gain is the whole point of the step-3 spike: whatever came out of
