@@ -285,7 +285,7 @@ routing, the UI and presets.
 - [x] **5. Drift correction.** Ring-fill tracking and drop/repeat correction, fill logged every 5 s. *Done when:* a 2-hour run holds fill within ±10 ms of target with zero underruns.
 - [x] **6. Routing.** `IPolicyConfig` switch, save original, restore on exit, panic hook, recovery on next launch. *Done when:* killing the process in Task Manager and relaunching restores your speakers as default.
 - [x] **7. Control thread.** Commands, events, device notifications, rebuild with backoff. *Done when:* unplugging headphones, changing the sample rate, and sleep/resume all recover without a restart.
-- [ ] **8. GUI.** Status line, on/off, slider, meters, output picker, setup screen, wired to the engine. *Done when:* everything in steps 3–7 works from the window.
+- [x] **8. GUI.** Status line, on/off, slider, meters, output picker, setup screen, wired to the engine. *Done when:* everything in steps 3–7 works from the window.
 - [ ] **9. Presets.** `presets` crate, storage, panel, built-ins. *Done when:* create, rename, duplicate, delete and load all work, and a hand-corrupted `presets.json` recovers from the backup.
 - [ ] **10. Safety rules.** Caps, unlock dialog, safe start, panic button, first-run notice. *Done when:* every row of the [Safety](#safety) table is checked by hand.
 - [ ] **11. Package.** Unsigned release build and installer. *Done when:* it installs and runs on a second PC with VB-Cable.
