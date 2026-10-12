@@ -1,8 +1,9 @@
 <!--
   BoostDeck's MSI, for the WiX Toolset v5 (wix.exe). Built by
   packaging/package.ps1, which passes:
-    Version   the crate version, e.g. 0.1.0
+    Version   the crate version, e.g. 1.0.0
     StageDir  the folder holding boostdeck.exe, README.txt and LICENSE.txt
+    IconFile  assets/boostdeck.ico
 
   Installs for all users into Program Files\BoostDeck with a Start menu
   shortcut. Settings, presets and logs live in the user's profile and are
@@ -19,10 +20,11 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of BoostDeck is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Taken from the exe, which carries the icon (crates/app/build.rs): an
-         advertised shortcut needs an icon named like its target, ICE50. -->
-    <Icon Id="BoostDeck.exe" SourceFile="$(var.StageDir)\boostdeck.exe" />
-    <Property Id="ARPPRODUCTICON" Value="BoostDeck.exe" />
+    <!-- The Apps & features icon. The Icon table stores its whole source file,
+         so this is the 23 KB .ico, never the exe: taking it from the exe once
+         put a second copy of BoostDeck in the MSI. -->
+    <Icon Id="BoostDeck.ico" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="BoostDeck.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/IAteDreams/BoostDeck" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -32,14 +34,7 @@
 
     <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
       <Component>
-        <File Source="$(var.StageDir)\boostdeck.exe" KeyPath="yes">
-          <Shortcut Name="BoostDeck"
-                    Description="Boost every app's sound past 100%"
-                    Directory="ProgramMenuFolder"
-                    WorkingDirectory="INSTALLFOLDER"
-                    Icon="BoostDeck.exe"
-                    Advertise="yes" />
-        </File>
+        <File Id="BoostDeckExe" Source="$(var.StageDir)\boostdeck.exe" KeyPath="yes" />
       </Component>
       <Component>
         <File Source="$(var.StageDir)\README.txt" />
@@ -49,8 +44,26 @@
       </Component>
     </ComponentGroup>
 
+    <!-- A plain shortcut, not an advertised one: it shows the icon the exe
+         carries (crates/app/build.rs), where an advertised shortcut would need
+         the exe itself as an Icon entry (ICE50). A plain shortcut gets its own
+         component, keyed by a per-user registry value (ICE43, ICE57). -->
+    <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder">
+      <Shortcut Name="BoostDeck"
+                Description="Boost every app's sound past 100%"
+                Target="[INSTALLFOLDER]boostdeck.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RegistryValue Root="HKCU"
+                     Key="Software\BoostDeck"
+                     Name="StartMenuShortcut"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes" />
+    </Component>
+
     <Feature Id="Main">
       <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
     </Feature>
   </Package>
 </Wix>
